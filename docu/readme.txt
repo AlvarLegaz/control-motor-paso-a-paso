@@ -41,17 +41,15 @@ Material
 
   ESP32              Rele           Notas
   -----              ----           -----
-  D14 (GPIO 14)      IN             RELE_PIN en el programa
+  D27 (GPIO 27)      IN             RELE_PIN en el programa
   GND                GND
   VIN (5 V del USB)  VCC            Para modulos de 5 V. Si es de 3,3 V, a 3V3
 
   El boton "Activar rele" de la web lo enciende durante el tiempo del campo
   (1 s por defecto, RELE_TIEMPO_S) y se apaga solo. Maximo RELE_MAX_S (600 s).
 
-  El GPIO 14 del ESP32 da unos pulsos durante el arranque, antes de que
-  empiece el programa: el rele puede chasquear un instante al encender o al
-  reiniciar la placa. Si lo que conecta el rele no lo admite, usa otro pin
-  (por ejemplo D26) cambiando RELE_PIN.
+  No pongas el rele en D14 ni en D15: esos pines dan pulsos durante el
+  arranque del ESP32 y el rele chasquearia al encender o reiniciar la placa.
 
   Muchos modulos con optoacoplador se encienden con IN a nivel BAJO. Si el
   rele se enciende al arrancar el ESP32 y se apaga al pulsar el boton, cambia

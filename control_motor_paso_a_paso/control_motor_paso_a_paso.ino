@@ -28,7 +28,7 @@
 
     ESP32               Modulo de rele
     -----               --------------
-    GPIO 26  (RELE_PIN) IN
+    GPIO 14  (RELE_PIN) IN
     GND                 GND
     VIN (5 V del USB)   VCC   (si el modulo es de 5 V)
     GND                 GND logico del driver (en TB6600: PUL- y DIR-)
@@ -92,7 +92,9 @@
 
 // Rele temporizado: el boton de la web lo enciende durante el tiempo
 // indicado y luego se apaga solo.
-#define RELE_PIN            26      // GPIO conectado a la entrada IN del modulo de rele (D26)
+#define RELE_PIN            14      // GPIO conectado a la entrada IN del modulo de rele (D14)
+                                    // Ojo: el GPIO 14 da pulsos durante el arranque del
+                                    // ESP32; el rele puede chasquear un instante al encender
 #define RELE_ACTIVO         HIGH    // nivel que enciende el rele. Muchos modulos con
                                     // optoacoplador se activan con LOW: si el rele se
                                     // enciende al arrancar y se apaga al pulsar, pon LOW
@@ -153,7 +155,7 @@
 
 // Los GPIO 34 a 39 del ESP32 son solo de entrada: no pueden mover el driver.
 #if (STEP_PIN >= 34 && STEP_PIN <= 39) || (DIR_PIN >= 34 && DIR_PIN <= 39) || (ENABLE_PIN >= 34 && ENABLE_PIN <= 39) || (RELE_PIN >= 34 && RELE_PIN <= 39)
-#error "STEP_PIN, DIR_PIN, ENABLE_PIN y RELE_PIN no pueden ser los GPIO 34 a 39: en el ESP32 son solo de entrada. Usa por ejemplo 33, 32, 25 y 26."
+#error "STEP_PIN, DIR_PIN, ENABLE_PIN y RELE_PIN no pueden ser los GPIO 34 a 39: en el ESP32 son solo de entrada. Usa por ejemplo 33, 32, 25 y 14."
 #endif
 
 // El temporizador del ESP32 no admite periodos menores de 50 us.

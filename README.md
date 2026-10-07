@@ -13,6 +13,8 @@ El montaje probado usa un ESP32 WROOM-32, un driver Pololu DRV8825 y un motor 17
 | GPIO 25 (D25) | EN | ENA+ |
 | GND | GND lógico | PUL-, DIR- y ENA- |
 
+El módulo de relé va a GPIO 26 (D26) en su entrada IN, con GND común y VCC a 5 V (VIN) o 3,3 V según el módulo. Los detalles están en [docu/readme.txt](docu/readme.txt).
+
 En la placa de desarrollo, D33 y D32 están justo al lado de D35 y D34. Los pines D34, D35, D36 (VP) y D39 (VN) no sirven para el driver: en el ESP32 son solo de entrada. El programa no compila si se ponen en `STEP_PIN` o `DIR_PIN`.
 
 - El ESP32 da señales de 3,3 V. A4988, DRV8825 y TMC2208 las aceptan directamente. Algunos drivers optoacoplados necesitan 5 V: si el motor no responde, revisa la hoja del driver.
@@ -33,6 +35,10 @@ Todos están al principio de `control_motor_paso_a_paso.ino`:
 | `ENABLE_ACTIVO` | LOW | Nivel de EN que activa el driver. LOW en DRV8825 y A4988 |
 | `DESACTIVAR_EN_REPOSO` | true | Corta la corriente del motor cuando lleva `REPOSO_MS` parado. Pon `false` si una carga puede mover el eje en reposo |
 | `REPOSO_MS` | 500 | Tiempo parado antes de cortar la corriente |
+| `RELE_PIN` | 26 | GPIO conectado a la entrada IN del módulo de relé |
+| `RELE_ACTIVO` | HIGH | Nivel que enciende el relé. Muchos módulos con optoacoplador usan LOW |
+| `RELE_TIEMPO_S` | 1 | Tiempo por defecto del relé en la web, en segundos |
+| `RELE_MAX_S` | 600 | Tiempo máximo del relé por orden |
 | `ENABLE_ESPERA_MS` | 5 | Espera tras dar corriente antes del primer paso |
 | `PULSOS_POR_VUELTA` | 200 | Pulsos para una vuelta. Con microstepping se multiplica: 1/8 son 1600, 1/16 son 3200 |
 | `PULSO_US` | 1000 | Microsegundos de STEP en alto y luego en bajo. Un paso dura el doble |
@@ -93,7 +99,8 @@ La página usa estas direcciones, que también se pueden llamar desde otro progr
 | `GET /` | Página de control |
 | `GET /mover?vueltas=1.5&sentido=der` | Gira 1,5 vueltas a la derecha. `sentido` es `der` o `izq` |
 | `GET /parar` | Para el motor |
-| `GET /estado` | Devuelve el estado en JSON: si se mueve, pulsos pendientes, sentido, pulsos por vuelta y si el motor tiene corriente |
+| `GET /rele?segundos=1` | Enciende el relé ese tiempo y luego se apaga solo |
+| `GET /estado` | Devuelve el estado en JSON: si se mueve, pulsos pendientes, sentido, pulsos por vuelta, si el motor tiene corriente, si el relé está encendido y cuánto le queda |
 
 ## Cómo se generan los pulsos
 

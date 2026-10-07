@@ -36,6 +36,26 @@ Material
   El DRV8825 acepta senales de 3,3 V y no necesita alimentacion logica.
 
 
+1b. ESP32 -> modulo de rele
+---------------------------
+
+  ESP32              Rele           Notas
+  -----              ----           -----
+  D26 (GPIO 26)      IN             RELE_PIN en el programa
+  GND                GND
+  VIN (5 V del USB)  VCC            Para modulos de 5 V. Si es de 3,3 V, a 3V3
+
+  El boton "Activar rele" de la web lo enciende durante el tiempo del campo
+  (1 s por defecto, RELE_TIEMPO_S) y se apaga solo. Maximo RELE_MAX_S (600 s).
+
+  Muchos modulos con optoacoplador se encienden con IN a nivel BAJO. Si el
+  rele se enciende al arrancar el ESP32 y se apaga al pulsar el boton, cambia
+  RELE_ACTIVO a LOW en el programa.
+  Con modulos de 5 V activos a nivel bajo, los 3,3 V del ESP32 a veces no
+  bastan para apagarlos del todo. Si se queda encendido, alimenta el modulo a
+  3,3 V si lo admite o usa un modulo activo a nivel alto.
+
+
 2. Fuente -> DRV8825 (potencia)
 -------------------------------
 

@@ -25,6 +25,12 @@
     GPIO 32  (DIR_PIN)  DIR    (en drivers optoacoplados tipo TB6600: DIR+)
     GPIO 25  (ENABLE_PIN) EN   corta la corriente del motor en reposo
                                (en drivers optoacoplados tipo TB6600: ENA+)
+
+    ESP32               Modulo de rele
+    -----               --------------
+    GPIO 26  (RELE_PIN) IN
+    GND                 GND
+    VIN (5 V del USB)   VCC   (si el modulo es de 5 V)
     GND                 GND logico del driver (en TB6600: PUL- y DIR-)
 
     En la placa de desarrollo, D33 y D32 estan justo al lado de D35 y D34.
@@ -84,6 +90,15 @@
 #define REPOSO_MS           500     // tiempo parado antes de cortar la corriente
 #define ENABLE_ESPERA_MS    5       // espera tras activar el driver antes del primer paso
 
+// Rele temporizado: el boton de la web lo enciende durante el tiempo
+// indicado y luego se apaga solo.
+#define RELE_PIN            26      // GPIO conectado a la entrada IN del modulo de rele (D26)
+#define RELE_ACTIVO         HIGH    // nivel que enciende el rele. Muchos modulos con
+                                    // optoacoplador se activan con LOW: si el rele se
+                                    // enciende al arrancar y se apaga al pulsar, pon LOW
+#define RELE_TIEMPO_S       1       // tiempo por defecto en la web, en segundos
+#define RELE_MAX_S          600     // tiempo maximo por orden, en segundos
+
 // Pulsos que necesita el driver para una vuelta completa del motor.
 // Motor de 200 pasos sin microstepping = 200.
 // Con microstepping se multiplica: 1/2 = 400, 1/8 = 1600, 1/16 = 3200...
@@ -137,8 +152,8 @@
 // =====================================================================
 
 // Los GPIO 34 a 39 del ESP32 son solo de entrada: no pueden mover el driver.
-#if (STEP_PIN >= 34 && STEP_PIN <= 39) || (DIR_PIN >= 34 && DIR_PIN <= 39) || (ENABLE_PIN >= 34 && ENABLE_PIN <= 39)
-#error "STEP_PIN, DIR_PIN y ENABLE_PIN no pueden ser los GPIO 34 a 39: en el ESP32 son solo de entrada. Usa por ejemplo 33, 32 y 25."
+#if (STEP_PIN >= 34 && STEP_PIN <= 39) || (DIR_PIN >= 34 && DIR_PIN <= 39) || (ENABLE_PIN >= 34 && ENABLE_PIN <= 39) || (RELE_PIN >= 34 && RELE_PIN <= 39)
+#error "STEP_PIN, DIR_PIN, ENABLE_PIN y RELE_PIN no pueden ser los GPIO 34 a 39: en el ESP32 son solo de entrada. Usa por ejemplo 33, 32, 25 y 26."
 #endif
 
 // El temporizador del ESP32 no admite periodos menores de 50 us.
@@ -156,6 +171,11 @@ bool sentidoDerecha = true;           // sentido del movimiento en curso
 bool temporizadorEnMarcha = false;
 bool driverActivo = false;            // true = bobinas con corriente
 unsigned long finMovimiento = 0;      // instante (millis) en que paro el motor
+
+// Estado del rele
+bool releEncendido = false;
+unsigned long releInicio = 0;         // instante (millis) en que se encendio
+unsigned long releDuracionMs = 0;     // cuanto tiempo tiene que estar encendido
 
 esp_timer_handle_t temporizadorPasos;
 portMUX_TYPE candadoMotor = portMUX_INITIALIZER_UNLOCKED;  // evita que el
@@ -251,6 +271,33 @@ void comprobarFinMovimiento() {
 
 
 // ---------------------------------------------------------------------
+//  RELE
+// ---------------------------------------------------------------------
+
+// Enciende el rele durante 'ms' milisegundos. Si ya estaba encendido,
+// vuelve a empezar a contar con el tiempo nuevo.
+void encenderRele(unsigned long ms) {
+  digitalWrite(RELE_PIN, RELE_ACTIVO);
+  releEncendido = true;
+  releInicio = millis();
+  releDuracionMs = ms;
+}
+
+void apagarRele() {
+  digitalWrite(RELE_PIN, !RELE_ACTIVO);
+  releEncendido = false;
+}
+
+// Se llama en loop(): apaga el rele cuando ha pasado su tiempo. No bloquea.
+void comprobarRele() {
+  if (releEncendido && millis() - releInicio >= releDuracionMs) {
+    apagarRele();
+    Serial.println("Rele apagado");
+  }
+}
+
+
+// ---------------------------------------------------------------------
 //  PAGINA WEB
 // ---------------------------------------------------------------------
 
@@ -274,6 +321,7 @@ const char PAGINA[] PROGMEM = R"rawliteral(
            border: 0; border-radius: 6px; background: #1565c0; color: #fff; }
   button:active { background: #0d47a1; }
   button.parar { background: #c62828; }
+  button.rele { background: #2e7d32; }
   #estado { font-weight: bold; }
 </style>
 </head>
@@ -297,7 +345,14 @@ const char PAGINA[] PROGMEM = R"rawliteral(
   </div>
 
   <div class="caja">
-    Estado: <span id="estado">-</span><br>
+    <label for="segundos">Tiempo del relé (segundos)</label>
+    <input id="segundos" type="number" min="0" step="any" value="%RELE_S%" inputmode="decimal">
+    <button class="rele" onclick="activarRele()">Activar relé</button>
+  </div>
+
+  <div class="caja">
+    Motor: <span id="estado">-</span><br>
+    Relé: <span id="rele">-</span><br>
     <span id="mensaje"></span>
   </div>
 
@@ -318,6 +373,12 @@ const char PAGINA[] PROGMEM = R"rawliteral(
     orden('/mover?vueltas=' + encodeURIComponent(vueltas) + '&sentido=' + sentido);
   }
 
+  // Enciende el rele durante los segundos del campo
+  function activarRele() {
+    var s = document.getElementById('segundos').value.replace(',', '.');
+    orden('/rele?segundos=' + encodeURIComponent(s));
+  }
+
   // Consulta el estado del motor cada segundo
   function leerEstado() {
     fetch('/estado')
@@ -326,6 +387,9 @@ const char PAGINA[] PROGMEM = R"rawliteral(
         document.getElementById('estado').textContent = e.moviendo
           ? 'girando a la ' + e.sentido + ', quedan ' + e.pulsos_pendientes + ' pulsos'
           : (e.con_corriente ? 'parado, con corriente' : 'parado, sin corriente');
+        document.getElementById('rele').textContent = e.rele
+          ? 'encendido, quedan ' + (e.rele_ms_restantes / 1000).toFixed(1) + ' s'
+          : 'apagado';
       })
       .catch(() => { document.getElementById('estado').textContent = 'sin conexión'; });
   }
@@ -345,6 +409,7 @@ const char PAGINA[] PROGMEM = R"rawliteral(
 void paginaPrincipal() {
   String html = PAGINA;
   html.replace("%PPV%", String(PULSOS_POR_VUELTA));
+  html.replace("%RELE_S%", String(RELE_TIEMPO_S));
   server.send(200, "text/html; charset=utf-8", html);
 }
 
@@ -399,7 +464,30 @@ void ordenParar() {
   server.send(200, "text/plain; charset=utf-8", "Motor parado.");
 }
 
-// GET /estado  -> {"moviendo":true,"pulsos_pendientes":120,"sentido":"derecha","pulsos_por_vuelta":200,"con_corriente":true}
+// GET /rele?segundos=1.5  -> enciende el rele 1,5 s y luego se apaga solo
+void ordenRele() {
+  String texto = server.arg("segundos");
+  texto.replace(",", ".");
+  float segundos = texto.toFloat();
+  if (segundos <= 0 || segundos > RELE_MAX_S) {
+    String error = "Tiempo del relé no válido (entre 0 y ";
+    error += RELE_MAX_S;
+    error += " segundos).";
+    server.send(400, "text/plain; charset=utf-8", error);
+    return;
+  }
+  unsigned long ms = (unsigned long)(segundos * 1000 + 0.5f);
+  encenderRele(ms);
+
+  String mensaje = "Relé encendido ";
+  mensaje += String(segundos, 1);
+  mensaje += " s";
+  Serial.println(mensaje);
+  server.send(200, "text/plain; charset=utf-8", mensaje);
+}
+
+// GET /estado  -> {"moviendo":true,"pulsos_pendientes":120,"sentido":"derecha",
+//                  "pulsos_por_vuelta":200,"con_corriente":true,"rele":false,"rele_ms_restantes":0}
 void ordenEstado() {
   String json = "{\"moviendo\":";
   json += (pulsosPendientes > 0) ? "true" : "false";
@@ -411,6 +499,11 @@ void ordenEstado() {
   json += PULSOS_POR_VUELTA;
   json += ",\"con_corriente\":";
   json += driverActivo ? "true" : "false";
+  json += ",\"rele\":";
+  json += releEncendido ? "true" : "false";
+  json += ",\"rele_ms_restantes\":";
+  unsigned long transcurrido = millis() - releInicio;
+  json += (releEncendido && transcurrido < releDuracionMs) ? releDuracionMs - transcurrido : 0;
   json += "}";
   server.send(200, "application/json", json);
 }
@@ -520,6 +613,11 @@ void setup() {
     driverActivo = true;
   }
 
+  // Rele apagado desde el primer momento (se fija el nivel antes de hacerlo salida)
+  digitalWrite(RELE_PIN, !RELE_ACTIVO);
+  pinMode(RELE_PIN, OUTPUT);
+  digitalWrite(RELE_PIN, !RELE_ACTIVO);
+
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, !LED_ENCENDIDO);
 
@@ -567,6 +665,7 @@ void setup() {
   server.on("/mover", HTTP_GET, ordenMover);
   server.on("/parar", HTTP_GET, ordenParar);
   server.on("/estado", HTTP_GET, ordenEstado);
+  server.on("/rele", HTTP_GET, ordenRele);
   server.onNotFound(paginaNoEncontrada);
   server.begin();
 }
@@ -574,5 +673,6 @@ void setup() {
 void loop() {
   server.handleClient();      // atiende la web
   comprobarFinMovimiento();   // para el temporizador al acabar los pulsos
+  comprobarRele();            // apaga el rele cuando acaba su tiempo
   actualizarLed();            // LED fijo si hay WiFi, parpadeando si no
 }

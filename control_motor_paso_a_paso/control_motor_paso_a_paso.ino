@@ -151,6 +151,13 @@
 // Limite de vueltas por orden, para evitar errores al teclear.
 #define VUELTAS_MAX         1000
 
+// El servidor web atiende una conexion cada vez. Los navegadores abren
+// conexiones por adelantado sin enviar nada, y el servidor se quedaba hasta
+// 5 s esperando en ellas sin atender las demas (por eso Parar llegaba tarde).
+// Una conexion que no envia nada en este tiempo se cierra para atender la
+// siguiente.
+#define CONEXION_INACTIVA_MS 300
+
 // =====================================================================
 
 // Los GPIO 34 a 39 del ESP32 son solo de entrada: no pueden mover el driver.
@@ -343,7 +350,7 @@ const char PAGINA[] PROGMEM = R"rawliteral(
       <button onclick="girar('izq', 1)">1 vuelta izquierda</button>
       <button onclick="girar('der', 1)">1 vuelta derecha</button>
     </div>
-    <button class="parar" onclick="orden('/parar')">Parar</button>
+    <button class="parar" onclick="parar(5)">Parar</button>
   </div>
 
   <div class="caja">
@@ -373,6 +380,17 @@ const char PAGINA[] PROGMEM = R"rawliteral(
       vueltas = document.getElementById('vueltas').value.replace(',', '.');
     }
     orden('/mover?vueltas=' + encodeURIComponent(vueltas) + '&sentido=' + sentido);
+  }
+
+  // Orden de parar. Si no llega al ESP32, se reintenta hasta 'intentos' veces.
+  function parar(intentos) {
+    fetch('/parar')
+      .then(r => r.text())
+      .then(t => { document.getElementById('mensaje').textContent = t; })
+      .catch(() => {
+        if (intentos > 1) setTimeout(() => parar(intentos - 1), 200);
+        else document.getElementById('mensaje').textContent = 'No se pudo enviar Parar';
+      });
   }
 
   // Enciende el rele durante los segundos del campo
@@ -512,6 +530,27 @@ void ordenEstado() {
 
 void paginaNoEncontrada() {
   server.send(404, "text/plain; charset=utf-8", "No encontrado");
+}
+
+// Cierra la conexion en curso si lleva CONEXION_INACTIVA_MS abierta sin
+// enviar nada, para que el servidor pase a la siguiente (por ejemplo, Parar).
+// Se llama en loop() antes de server.handleClient().
+void cerrarConexionInactiva() {
+  static bool vigilando = false;
+  static unsigned long desde = 0;
+
+  NetworkClient& cliente = server.client();
+  if (cliente.connected() && cliente.available() == 0) {
+    if (!vigilando) {
+      vigilando = true;
+      desde = millis();
+    } else if (millis() - desde > CONEXION_INACTIVA_MS) {
+      cliente.stop();
+      vigilando = false;
+    }
+  } else {
+    vigilando = false;
+  }
 }
 
 
@@ -673,6 +712,7 @@ void setup() {
 }
 
 void loop() {
+  cerrarConexionInactiva();   // no deja que una conexion vacia bloquee la web
   server.handleClient();      // atiende la web
   comprobarFinMovimiento();   // para el temporizador al acabar los pulsos
   comprobarRele();            // apaga el rele cuando acaba su tiempo

@@ -52,6 +52,7 @@ Todos están al principio de `control_motor_paso_a_paso.ino`:
 | `DIR_DERECHA` | HIGH | Nivel de DIR para girar a la derecha. Cámbialo a LOW si gira al revés |
 | `DIR_SETUP_US` | 5 | Espera entre cambiar DIR y el primer pulso |
 | `VUELTAS_MAX` | 1000 | Máximo de vueltas por orden |
+| `CONEXION_INACTIVA_MS` | 300 | Tiempo que el servidor espera en una conexión que no envía nada antes de cerrarla y atender la siguiente |
 
 Con `PULSO_US` a 1000 el motor da 500 pasos por segundo, que son 2,5 vueltas por segundo a 200 pulsos por vuelta. Si vibra sin girar o pierde pasos, sube `PULSO_US`.
 
@@ -101,6 +102,12 @@ La página usa estas direcciones, que también se pueden llamar desde otro progr
 | `GET /parar` | Para el motor |
 | `GET /rele?segundos=1` | Enciende el relé ese tiempo y luego se apaga solo |
 | `GET /estado` | Devuelve el estado en JSON: si se mueve, pulsos pendientes, sentido, pulsos por vuelta, si el motor tiene corriente, si el relé está encendido y cuánto le queda |
+
+## Por qué Parar llegaba tarde
+
+El servidor web del ESP32 atiende una conexión cada vez. Los navegadores abren conexiones por adelantado sin enviar nada, para ganar tiempo en el siguiente clic, y el servidor se quedaba hasta 5 segundos esperando en una de ellas sin atender las demás. Si Parar llegaba en ese momento, esperaba en cola y un movimiento corto terminaba antes.
+
+Ahora `cerrarConexionInactiva()` cierra la conexión en curso si lleva `CONEXION_INACTIVA_MS` abierta sin enviar nada, y el servidor pasa a la siguiente. Además, el botón Parar de la página reintenta el envío hasta 5 veces si falla.
 
 ## Cómo se generan los pulsos
 

@@ -22,7 +22,11 @@ Material
                                     Si quedan sueltos el driver NO funciona
                                     (los dos llevan resistencia a masa).
   GND                GND            El GND de la esquina, junto a FLT (masa logica)
-  (sin conectar)     EN             Sin conectar = driver habilitado
+  D25 (GPIO 25)      EN             ENABLE_PIN en el programa. Corta la
+                                    corriente del motor cuando lleva parado
+                                    REPOSO_MS (500 ms). Sin este cable el
+                                    driver queda siempre habilitado y el motor
+                                    siempre con corriente.
   (sin conectar)     M0, M1, M2     Sin conectar = paso completo (200 pulsos/vuelta)
   (sin conectar)     FLT            Salida de fallo, no se usa
 
@@ -61,6 +65,22 @@ Material
 
   NUNCA conectar ni desconectar el motor con el driver alimentado: rompe el
   driver.
+
+
+3b. Corriente en reposo
+-----------------------
+
+  Parado y habilitado, el DRV8825 deja las dos bobinas al 70 % del limite
+  de corriente (en paso completo) para mantener el eje fijo. Motor y driver
+  se calientan aunque no se muevan.
+
+  Con DESACTIVAR_EN_REPOSO = true (por defecto) el programa pone EN en alto
+  a los REPOSO_MS de parar: el motor queda sin corriente y con el eje libre.
+  Antes de cada movimiento lo vuelve a habilitar.
+
+  Pon DESACTIVAR_EN_REPOSO = false si el eje lleva una carga que lo pueda
+  mover estando parado (un peso vertical, un muelle...): sin corriente se
+  desplazaria y el programa no se enteraria.
 
 
 4. Limite de corriente (potenciometro del DRV8825)

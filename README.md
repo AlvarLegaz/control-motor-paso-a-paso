@@ -10,7 +10,8 @@ El montaje probado usa un ESP32 WROOM-32, un driver Pololu DRV8825 y un motor 17
 |---|---|---|
 | GPIO 33 (D33) | STEP | PUL+ |
 | GPIO 32 (D32) | DIR | DIR+ |
-| GND | GND lógico | PUL- y DIR- |
+| GPIO 25 (D25) | EN | ENA+ |
+| GND | GND lógico | PUL-, DIR- y ENA- |
 
 En la placa de desarrollo, D33 y D32 están justo al lado de D35 y D34. Los pines D34, D35, D36 (VP) y D39 (VN) no sirven para el driver: en el ESP32 son solo de entrada. El programa no compila si se ponen en `STEP_PIN` o `DIR_PIN`.
 
@@ -28,6 +29,11 @@ Todos están al principio de `control_motor_paso_a_paso.ino`:
 |---|---|---|
 | `STEP_PIN` | 33 | GPIO conectado a STEP |
 | `DIR_PIN` | 32 | GPIO conectado a DIR |
+| `ENABLE_PIN` | 25 | GPIO conectado a EN, para cortar la corriente del motor en reposo |
+| `ENABLE_ACTIVO` | LOW | Nivel de EN que activa el driver. LOW en DRV8825 y A4988 |
+| `DESACTIVAR_EN_REPOSO` | true | Corta la corriente del motor cuando lleva `REPOSO_MS` parado. Pon `false` si una carga puede mover el eje en reposo |
+| `REPOSO_MS` | 500 | Tiempo parado antes de cortar la corriente |
+| `ENABLE_ESPERA_MS` | 5 | Espera tras dar corriente antes del primer paso |
 | `PULSOS_POR_VUELTA` | 200 | Pulsos para una vuelta. Con microstepping se multiplica: 1/8 son 1600, 1/16 son 3200 |
 | `PULSO_US` | 1000 | Microsegundos de STEP en alto y luego en bajo. Un paso dura el doble |
 | `LED_PIN` | 2 | LED de estado de la WiFi, el azul de la placa |
@@ -87,7 +93,7 @@ La página usa estas direcciones, que también se pueden llamar desde otro progr
 | `GET /` | Página de control |
 | `GET /mover?vueltas=1.5&sentido=der` | Gira 1,5 vueltas a la derecha. `sentido` es `der` o `izq` |
 | `GET /parar` | Para el motor |
-| `GET /estado` | Devuelve el estado en JSON: si se mueve, pulsos pendientes, sentido y pulsos por vuelta |
+| `GET /estado` | Devuelve el estado en JSON: si se mueve, pulsos pendientes, sentido, pulsos por vuelta y si el motor tiene corriente |
 
 ## Cómo se generan los pulsos
 

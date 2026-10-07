@@ -22,6 +22,8 @@
     -----               ------
     GPIO 33  (STEP_PIN) STEP   (en drivers optoacoplados tipo TB6600: PUL+)
     GPIO 32  (DIR_PIN)  DIR    (en drivers optoacoplados tipo TB6600: DIR+)
+    GPIO 25  (ENABLE_PIN) EN   corta la corriente del motor en reposo
+                               (en drivers optoacoplados tipo TB6600: ENA+)
     GND                 GND logico del driver (en TB6600: PUL- y DIR-)
 
     En la placa de desarrollo, D33 y D32 estan justo al lado de D35 y D34.
@@ -64,6 +66,17 @@
 
 #define STEP_PIN            33      // GPIO conectado a STEP del driver (D33)
 #define DIR_PIN             32      // GPIO conectado a DIR del driver  (D32)
+#define ENABLE_PIN          25      // GPIO conectado a EN del driver   (D25)
+#define ENABLE_ACTIVO       LOW     // nivel de EN que activa el driver (DRV8825 y A4988: LOW)
+
+// Corriente en reposo. Parado, el driver mantiene las bobinas con corriente
+// para que el eje no se mueva (par de retencion), y motor y driver se
+// calientan. Con true, el programa corta la corriente por EN cuando el motor
+// lleva REPOSO_MS parado y la vuelve a dar justo antes de moverse.
+// Pon false si el eje lleva una carga que lo pueda mover estando parado.
+#define DESACTIVAR_EN_REPOSO true
+#define REPOSO_MS           500     // tiempo parado antes de cortar la corriente
+#define ENABLE_ESPERA_MS    5       // espera tras activar el driver antes del primer paso
 
 // Pulsos que necesita el driver para una vuelta completa del motor.
 // Motor de 200 pasos sin microstepping = 200.
@@ -118,8 +131,8 @@
 // =====================================================================
 
 // Los GPIO 34 a 39 del ESP32 son solo de entrada: no pueden mover el driver.
-#if (STEP_PIN >= 34 && STEP_PIN <= 39) || (DIR_PIN >= 34 && DIR_PIN <= 39)
-#error "STEP_PIN y DIR_PIN no pueden ser los GPIO 34 a 39: en el ESP32 son solo de entrada. Usa por ejemplo 33 y 32."
+#if (STEP_PIN >= 34 && STEP_PIN <= 39) || (DIR_PIN >= 34 && DIR_PIN <= 39) || (ENABLE_PIN >= 34 && ENABLE_PIN <= 39)
+#error "STEP_PIN, DIR_PIN y ENABLE_PIN no pueden ser los GPIO 34 a 39: en el ESP32 son solo de entrada. Usa por ejemplo 33, 32 y 25."
 #endif
 
 // El temporizador del ESP32 no admite periodos menores de 50 us.
@@ -135,6 +148,8 @@ volatile long pulsosPendientes = 0;   // pulsos que faltan por dar
 volatile bool stepEnAlto = false;     // estado actual de la salida STEP
 bool sentidoDerecha = true;           // sentido del movimiento en curso
 bool temporizadorEnMarcha = false;
+bool driverActivo = false;            // true = bobinas con corriente
+unsigned long finMovimiento = 0;      // instante (millis) en que paro el motor
 
 esp_timer_handle_t temporizadorPasos;
 portMUX_TYPE candadoMotor = portMUX_INITIALIZER_UNLOCKED;  // evita que el
@@ -163,11 +178,27 @@ void darPaso(void* arg) {
   portEXIT_CRITICAL(&candadoMotor);
 }
 
+// Da corriente a las bobinas (driver habilitado por EN).
+void activarDriver() {
+  if (driverActivo) return;
+  digitalWrite(ENABLE_PIN, ENABLE_ACTIVO);
+  driverActivo = true;
+  delay(ENABLE_ESPERA_MS);   // deja que el eje se asiente antes de mover
+}
+
+// Corta la corriente de las bobinas. El eje queda libre.
+void desactivarDriver() {
+  digitalWrite(ENABLE_PIN, !ENABLE_ACTIVO);
+  driverActivo = false;
+  Serial.println("Motor en reposo: sin corriente");
+}
+
 // Prepara un movimiento de 'pulsos' pulsos en el sentido indicado
 // (true = derecha, false = izquierda) y arranca el temporizador.
 void moverMotor(long pulsos, bool direccion) {
   if (pulsos <= 0) return;
   if (temporizadorEnMarcha) esp_timer_stop(temporizadorPasos);
+  activarDriver();
 
   // 1. Configurar DIR
   digitalWrite(DIR_PIN, direccion ? DIR_DERECHA : !DIR_DERECHA);
@@ -188,6 +219,7 @@ void moverMotor(long pulsos, bool direccion) {
 void pararMotor() {
   if (temporizadorEnMarcha) esp_timer_stop(temporizadorPasos);
   temporizadorEnMarcha = false;
+  finMovimiento = millis();
   portENTER_CRITICAL(&candadoMotor);
   pulsosPendientes = 0;
   digitalWrite(STEP_PIN, LOW);
@@ -196,12 +228,18 @@ void pararMotor() {
 }
 
 // Se llama en loop(): cuando el temporizador ha dado todos los pulsos, lo
-// para y lo avisa por el Monitor Serie.
+// para y lo avisa por el Monitor Serie. Si DESACTIVAR_EN_REPOSO, corta la
+// corriente cuando el motor lleva REPOSO_MS parado.
 void comprobarFinMovimiento() {
   if (temporizadorEnMarcha && pulsosPendientes == 0) {
     esp_timer_stop(temporizadorPasos);
     temporizadorEnMarcha = false;
+    finMovimiento = millis();
     Serial.println("Movimiento terminado");
+  }
+  if (DESACTIVAR_EN_REPOSO && driverActivo && !temporizadorEnMarcha &&
+      millis() - finMovimiento >= REPOSO_MS) {
+    desactivarDriver();
   }
 }
 
@@ -281,7 +319,7 @@ const char PAGINA[] PROGMEM = R"rawliteral(
       .then(e => {
         document.getElementById('estado').textContent = e.moviendo
           ? 'girando a la ' + e.sentido + ', quedan ' + e.pulsos_pendientes + ' pulsos'
-          : 'parado';
+          : (e.con_corriente ? 'parado, con corriente' : 'parado, sin corriente');
       })
       .catch(() => { document.getElementById('estado').textContent = 'sin conexión'; });
   }
@@ -355,7 +393,7 @@ void ordenParar() {
   server.send(200, "text/plain; charset=utf-8", "Motor parado.");
 }
 
-// GET /estado  -> {"moviendo":true,"pulsos_pendientes":120,"sentido":"derecha","pulsos_por_vuelta":200}
+// GET /estado  -> {"moviendo":true,"pulsos_pendientes":120,"sentido":"derecha","pulsos_por_vuelta":200,"con_corriente":true}
 void ordenEstado() {
   String json = "{\"moviendo\":";
   json += (pulsosPendientes > 0) ? "true" : "false";
@@ -365,6 +403,8 @@ void ordenEstado() {
   json += sentidoDerecha ? "derecha" : "izquierda";
   json += "\",\"pulsos_por_vuelta\":";
   json += PULSOS_POR_VUELTA;
+  json += ",\"con_corriente\":";
+  json += driverActivo ? "true" : "false";
   json += "}";
   server.send(200, "application/json", json);
 }
@@ -443,6 +483,17 @@ void setup() {
   pinMode(DIR_PIN, OUTPUT);
   digitalWrite(STEP_PIN, LOW);
   digitalWrite(DIR_PIN, DIR_DERECHA);
+
+  // Driver: sin corriente al arrancar si se apaga en reposo; si no, siempre activo
+  pinMode(ENABLE_PIN, OUTPUT);
+  if (DESACTIVAR_EN_REPOSO) {
+    digitalWrite(ENABLE_PIN, !ENABLE_ACTIVO);
+    driverActivo = false;
+  } else {
+    digitalWrite(ENABLE_PIN, ENABLE_ACTIVO);
+    driverActivo = true;
+  }
+
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, !LED_ENCENDIDO);
 

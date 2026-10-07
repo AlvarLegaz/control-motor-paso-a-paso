@@ -89,10 +89,10 @@ La página usa estas direcciones, que también se pueden llamar desde otro progr
 | `GET /parar` | Para el motor |
 | `GET /estado` | Devuelve el estado en JSON: si se mueve, pulsos pendientes, sentido y pulsos por vuelta |
 
-## Por qué el movimiento no bloquea la web
+## Cómo se generan los pulsos
 
 Generar los pulsos con un bucle de `delayMicroseconds()` deja el ESP32 ocupado hasta que el motor termina: 10 vueltas a 2 ms por paso son 4 segundos sin atender la web ni el botón Parar.
 
-Por eso `moverMotor()` solo configura DIR y apunta cuántos pulsos hay que dar. En cada pasada de `loop()` se atiende la web y, si ya ha pasado `PULSO_US` desde el último cambio, `actualizarMotor()` cambia la salida STEP comparando con `micros()`. El número de pulsos es siempre exacto.
+Una versión anterior los generaba en `loop()` comparando con `micros()`. Funcionaba, pero mientras la web respondía una petición, unos pocos milisegundos, no salían pulsos. El motor se frenaba de golpe y se oía un golpe seco cada segundo, cuando la página consulta el estado.
 
-Mientras el ESP32 responde a una petición de la web, que tarda unos pocos milisegundos, el pulso en curso se alarga un poco. El motor nunca va más rápido de lo configurado, solo un instante más lento. A velocidades altas y sin rampa de aceleración eso puede notarse como un pequeño tirón cada segundo, cuando la página consulta el estado. Si molesta, sube `PULSO_US`.
+Ahora `moverMotor()` configura DIR, apunta cuántos pulsos hay que dar y arranca un temporizador del ESP32 (`esp_timer`). El temporizador salta cada `PULSO_US` microsegundos y alterna la salida STEP en `darPaso()`, independientemente de lo que esté haciendo la web. El número de pulsos es siempre exacto. `PULSO_US` debe ser de 50 µs como mínimo, que es lo menos que admite el temporizador.

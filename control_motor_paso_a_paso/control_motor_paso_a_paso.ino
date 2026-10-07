@@ -35,17 +35,21 @@
       DRV8825 viene habilitada por defecto si no se conecta).
     - La alimentacion del motor va al driver, nunca al ESP32. Une las masas.
 
-  POR QUE NO SE USA delayMicroseconds() PARA LOS PULSOS
-    Con un bucle de delayMicroseconds() el ESP32 se queda ocupado hasta que el
-    motor termina: 10 vueltas a 2 ms por paso son 4 segundos sin atender la web
-    (ni el boton Parar). Por eso los pulsos se generan en loop() comparando el
-    tiempo con micros(): en cada pasada de loop() se atiende la web y, si ya ha
-    pasado PULSO_US desde el ultimo cambio, se cambia la salida STEP.
+  COMO SE GENERAN LOS PULSOS
+    Con un bucle de delayMicroseconds() el ESP32 se quedaria ocupado hasta que
+    el motor terminara: 10 vueltas a 2 ms por paso son 4 segundos sin atender
+    la web ni el boton Parar.
+    Generarlos en loop() comparando con micros() tampoco basta: mientras la web
+    responde una peticion (unos milisegundos) no salen pulsos, el motor se
+    frena de golpe y se oye un "pum".
+    Por eso los pulsos los da un temporizador del ESP32 (esp_timer) que salta
+    cada PULSO_US microsegundos, pase lo que pase con la web.
 */
 
 #include <WiFi.h>
 #include <WebServer.h>
 #include <ESPmDNS.h>     // nombre motor.local (viene con el core ESP32)
+#include "esp_timer.h"   // temporizador de los pulsos (viene con el core ESP32)
 
 // Nombre y clave de la WiFi de casa: WIFI_ROUTER_SSID y WIFI_ROUTER_PASSWORD
 #if __has_include("credenciales.h")
@@ -118,63 +122,86 @@
 #error "STEP_PIN y DIR_PIN no pueden ser los GPIO 34 a 39: en el ESP32 son solo de entrada. Usa por ejemplo 33 y 32."
 #endif
 
+// El temporizador del ESP32 no admite periodos menores de 50 us.
+#if PULSO_US < 50
+#error "PULSO_US debe ser de 50 microsegundos o mas."
+#endif
+
 WebServer server(80);
 
-// Estado del movimiento. moverMotor() lo prepara y actualizarMotor(), que se
-// llama en cada pasada de loop(), genera los pulsos sin bloquear.
-long pulsosPendientes = 0;        // pulsos que faltan por dar
-bool stepEnAlto = false;          // estado actual de la salida STEP
-unsigned long ultimoCambio = 0;   // instante (micros) del ultimo cambio de STEP
-bool sentidoDerecha = true;       // sentido del movimiento en curso
+// Estado del movimiento. moverMotor() lo prepara y el temporizador da los
+// pulsos. 'volatile' porque el temporizador corre en otra tarea del ESP32.
+volatile long pulsosPendientes = 0;   // pulsos que faltan por dar
+volatile bool stepEnAlto = false;     // estado actual de la salida STEP
+bool sentidoDerecha = true;           // sentido del movimiento en curso
+bool temporizadorEnMarcha = false;
+
+esp_timer_handle_t temporizadorPasos;
+portMUX_TYPE candadoMotor = portMUX_INITIALIZER_UNLOCKED;  // evita que el
+                         // temporizador y la web toquen el estado a la vez
 
 
 // ---------------------------------------------------------------------
 //  MOTOR
 // ---------------------------------------------------------------------
 
+// Lo llama el temporizador cada PULSO_US microsegundos. Alterna STEP: un
+// pulso es ALTO durante PULSO_US y BAJO durante PULSO_US, y cuenta como dado
+// al bajar STEP.
+void darPaso(void* arg) {
+  portENTER_CRITICAL(&candadoMotor);
+  if (pulsosPendientes > 0) {
+    if (!stepEnAlto) {
+      digitalWrite(STEP_PIN, HIGH);
+      stepEnAlto = true;
+    } else {
+      digitalWrite(STEP_PIN, LOW);
+      stepEnAlto = false;
+      pulsosPendientes = pulsosPendientes - 1;
+    }
+  }
+  portEXIT_CRITICAL(&candadoMotor);
+}
+
 // Prepara un movimiento de 'pulsos' pulsos en el sentido indicado
-// (true = derecha, false = izquierda). Los pulsos los genera loop().
+// (true = derecha, false = izquierda) y arranca el temporizador.
 void moverMotor(long pulsos, bool direccion) {
   if (pulsos <= 0) return;
+  if (temporizadorEnMarcha) esp_timer_stop(temporizadorPasos);
 
   // 1. Configurar DIR
   digitalWrite(DIR_PIN, direccion ? DIR_DERECHA : !DIR_DERECHA);
   delayMicroseconds(DIR_SETUP_US);
 
-  // 2. Encargar el numero exacto de pulsos
+  // 2. Encargar el numero exacto de pulsos y arrancar el temporizador
   sentidoDerecha = direccion;
+  portENTER_CRITICAL(&candadoMotor);
   digitalWrite(STEP_PIN, LOW);
   stepEnAlto = false;
-  ultimoCambio = micros();
   pulsosPendientes = pulsos;
+  portEXIT_CRITICAL(&candadoMotor);
+  esp_timer_start_periodic(temporizadorPasos, PULSO_US);
+  temporizadorEnMarcha = true;
 }
 
 // Detiene el motor inmediatamente.
 void pararMotor() {
+  if (temporizadorEnMarcha) esp_timer_stop(temporizadorPasos);
+  temporizadorEnMarcha = false;
+  portENTER_CRITICAL(&candadoMotor);
   pulsosPendientes = 0;
   digitalWrite(STEP_PIN, LOW);
   stepEnAlto = false;
+  portEXIT_CRITICAL(&candadoMotor);
 }
 
-// Genera los pulsos pendientes. Cada pulso es STEP en ALTO durante PULSO_US
-// y en BAJO durante PULSO_US. Un pulso cuenta como dado al bajar STEP.
-void actualizarMotor() {
-  if (pulsosPendientes <= 0) return;
-
-  unsigned long ahora = micros();
-  if (ahora - ultimoCambio < PULSO_US) return;   // aun no toca
-  ultimoCambio = ahora;
-
-  if (!stepEnAlto) {
-    digitalWrite(STEP_PIN, HIGH);
-    stepEnAlto = true;
-  } else {
-    digitalWrite(STEP_PIN, LOW);
-    stepEnAlto = false;
-    pulsosPendientes--;
-    if (pulsosPendientes == 0) {
-      Serial.println("Movimiento terminado");
-    }
+// Se llama en loop(): cuando el temporizador ha dado todos los pulsos, lo
+// para y lo avisa por el Monitor Serie.
+void comprobarFinMovimiento() {
+  if (temporizadorEnMarcha && pulsosPendientes == 0) {
+    esp_timer_stop(temporizadorPasos);
+    temporizadorEnMarcha = false;
+    Serial.println("Movimiento terminado");
   }
 }
 
@@ -419,6 +446,12 @@ void setup() {
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, !LED_ENCENDIDO);
 
+  // Temporizador que da los pulsos (se arranca en moverMotor)
+  esp_timer_create_args_t argsTemporizador = {};
+  argsTemporizador.callback = &darPaso;
+  argsTemporizador.name = "pasos";
+  esp_timer_create(&argsTemporizador, &temporizadorPasos);
+
   Serial.println();
   Serial.println("Control motor paso a paso");
 
@@ -458,15 +491,11 @@ void setup() {
   server.on("/parar", HTTP_GET, ordenParar);
   server.on("/estado", HTTP_GET, ordenEstado);
   server.onNotFound(paginaNoEncontrada);
-
-  // Por defecto handleClient() espera 1 ms cuando no hay peticiones. Eso
-  // limitaria la frecuencia de los pulsos, asi que se desactiva.
-  server.enableDelay(false);
   server.begin();
 }
 
 void loop() {
-  server.handleClient();   // atiende la web (no bloquea si no hay peticiones)
-  actualizarMotor();       // da el siguiente cambio de STEP si ya toca
-  actualizarLed();         // LED fijo si hay WiFi, parpadeando si no
+  server.handleClient();      // atiende la web
+  comprobarFinMovimiento();   // para el temporizador al acabar los pulsos
+  actualizarLed();            // LED fijo si hay WiFi, parpadeando si no
 }

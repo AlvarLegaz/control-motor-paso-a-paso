@@ -1,6 +1,8 @@
 # Control motor paso a paso
 
-Programa para ESP32 con Arduino IDE que controla un motor paso a paso desde una página web. El ESP32 crea su propia red WiFi en modo Access Point, así que no hace falta router. Funciona con cualquier driver de entradas STEP y DIR: A4988, DRV8825, TMC2208, TB6600, DM542 y similares.
+Programa para ESP32 con Arduino IDE que controla un motor paso a paso desde una página web. El ESP32 se conecta a la WiFi de casa; si no lo consigue en 15 segundos, crea su propia red ESP32_MOTOR en modo Access Point. Funciona con cualquier driver de entradas STEP y DIR: A4988, DRV8825, TMC2208, TB6600, DM542 y similares.
+
+El montaje probado usa un ESP32 WROOM-32, un driver Pololu DRV8825 y un motor 17HS19-2004S1. Sus hojas de datos y el detalle de todas las conexiones, el ajuste de corriente y el microstepping están en [docu/readme.txt](docu/readme.txt).
 
 ## Conexiones
 
@@ -28,8 +30,13 @@ Todos están al principio de `control_motor_paso_a_paso.ino`:
 | `DIR_PIN` | 32 | GPIO conectado a DIR |
 | `PULSOS_POR_VUELTA` | 200 | Pulsos para una vuelta. Con microstepping se multiplica: 1/8 son 1600, 1/16 son 3200 |
 | `PULSO_US` | 1000 | Microsegundos de STEP en alto y luego en bajo. Un paso dura el doble |
-| `WIFI_SSID` | ESP32_MOTOR | Nombre de la red WiFi |
-| `WIFI_PASSWORD` | 12345678 | Clave de la red, de 8 caracteres como mínimo |
+| `LED_PIN` | 2 | LED de estado de la WiFi, el azul de la placa |
+| `TIEMPO_CONEXION_MS` | 15000 | Tiempo máximo intentando conectar al router |
+| `NOMBRE_RED` | motor | La web se abre también en `http://motor.local` |
+| `WIFI_SSID` | ESP32_MOTOR | Nombre de la red propia, si no hay router |
+| `WIFI_PASSWORD` | 12345678 | Clave de la red propia, de 8 caracteres como mínimo |
+| `WIFI_CANAL` | 6 | Canal de la red propia |
+| `WIFI_POTENCIA` | 8,5 dBm | Potencia de la red propia. Baja porque en placas clónicas la red no aparecía a potencia máxima |
 | `DIR_DERECHA` | HIGH | Nivel de DIR para girar a la derecha. Cámbialo a LOW si gira al revés |
 | `DIR_SETUP_US` | 5 | Espera entre cambiar DIR y el primer pulso |
 | `VUELTAS_MAX` | 1000 | Máximo de vueltas por orden |
@@ -44,17 +51,26 @@ Con `PULSO_US` a 1000 el motor da 500 pasos por segundo, que son 2,5 vueltas por
    https://espressif.github.io/arduino-esp32/package_esp32_index.json
    ```
 
-2. Abre `control_motor_paso_a_paso/control_motor_paso_a_paso.ino`.
-3. Elige la placa "ESP32 Dev Module" y el puerto del ESP32.
-4. Pulsa Subir.
+2. En la carpeta `control_motor_paso_a_paso`, copia `credenciales.h.ejemplo` como `credenciales.h` y pon el nombre y la clave de tu WiFi. El ESP32 solo usa redes de 2,4 GHz. `credenciales.h` está en `.gitignore` y no se sube al repositorio.
+3. Abre `control_motor_paso_a_paso/control_motor_paso_a_paso.ino`.
+4. Elige la placa "ESP32 Dev Module" y el puerto del ESP32.
+5. Pulsa Subir. Si sale "Wrong boot mode", mantén pulsado BOOT, pulsa y suelta EN, y sigue con BOOT pulsado hasta que salga "Writing at".
 
-No hace falta instalar ninguna librería: `WiFi.h` y `WebServer.h` vienen con el soporte de ESP32.
+No hace falta instalar ninguna librería: `WiFi.h`, `WebServer.h` y `ESPmDNS.h` vienen con el soporte de ESP32.
 
 ## Uso
 
-1. Abre el Monitor Serie a 115200 baudios. Al arrancar muestra la IP, normalmente 192.168.4.1.
-2. Conecta el móvil, la tablet o el PC a la red `ESP32_MOTOR` con la clave `12345678`.
-3. Abre en el navegador `http://192.168.4.1`.
+1. Abre el Monitor Serie a 115200 baudios. Al arrancar dice si se ha conectado a la WiFi de casa y muestra la IP.
+2. Con el móvil o el PC en la misma WiFi, abre en el navegador `http://motor.local` o esa IP.
+3. Si no pudo conectar al router, crea su red propia: conéctate a `ESP32_MOTOR` con la clave `12345678` y abre `http://192.168.4.1`.
+
+El LED azul de la placa indica el estado de la WiFi:
+
+| LED | Estado |
+|---|---|
+| Fijo | Conectado a la WiFi de casa |
+| Parpadeo rápido | Conectando, o se ha perdido la conexión |
+| Parpadeo lento | Sin router, con la red propia ESP32_MOTOR |
 
 La página muestra los pulsos por vuelta, un campo para el número de vueltas, los botones de girar a cada lado, los de una vuelta a cada lado y un botón Parar. También muestra si el motor está girando y cuántos pulsos le quedan.
 

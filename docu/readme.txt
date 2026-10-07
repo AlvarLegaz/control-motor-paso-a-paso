@@ -1,0 +1,117 @@
+CONEXIONES - CONTROL MOTOR PASO A PASO
+======================================
+
+Material
+  - ESP32 WROOM-32 (placa de desarrollo con conversor USB CH340)
+  - Driver Pololu 2133: DRV8825 (hoja: POLOLU-2133.pdf)
+  - Motor STEPPERONLINE 17HS19-2004S1 (hoja: 17HS19-2004S1_Full_Datasheet.pdf)
+      bipolar, 1,8 grados por paso (200 pasos por vuelta),
+      2,0 A por fase, 1,6 ohmios por fase, 3,0 mH, 0,59 Nm
+  - Fuente para el motor de 8,2 a 45 V (por ejemplo 12 V o 24 V)
+  - Condensador electrolitico de 100 uF (minimo 47 uF), de tension mayor que la fuente
+
+
+1. ESP32 -> DRV8825 (senales)
+-----------------------------
+
+  ESP32              DRV8825        Notas
+  -----              -------        -----
+  D33 (GPIO 33)      STEP           STEP_PIN en el programa
+  D32 (GPIO 32)      DIR            DIR_PIN en el programa
+  3V3                RST y SLP      Puentear RST con SLP y unirlos a 3V3.
+                                    Si quedan sueltos el driver NO funciona
+                                    (los dos llevan resistencia a masa).
+  GND                GND            El GND de la esquina, junto a FLT (masa logica)
+  (sin conectar)     EN             Sin conectar = driver habilitado
+  (sin conectar)     M0, M1, M2     Sin conectar = paso completo (200 pulsos/vuelta)
+  (sin conectar)     FLT            Salida de fallo, no se usa
+
+  No usar D34, D35, D36 (VP) ni D39 (VN) para STEP o DIR: en el ESP32 son
+  solo de entrada. El programa no compila si se ponen.
+
+  El DRV8825 acepta senales de 3,3 V y no necesita alimentacion logica.
+
+
+2. Fuente -> DRV8825 (potencia)
+-------------------------------
+
+  Fuente +           VMOT
+  Fuente -           GND            El GND junto a VMOT
+  Condensador        VMOT y GND     Lo mas cerca posible del driver, con el
+                                    negativo (franja) a GND
+
+  La masa de la fuente y la del ESP32 tienen que estar unidas (en la placa
+  del driver los dos GND ya estan conectados entre si).
+
+  La fuente del motor NUNCA va al ESP32.
+
+
+3. Motor -> DRV8825
+-------------------
+
+  Cable del motor    Bobina         DRV8825
+  ---------------    ------         -------
+  Negro  (BLK)       A+             A1
+  Verde  (GRN)       A-             A2
+  Rojo   (RED)       B+             B1
+  Azul   (BLU)       B-             B2
+
+  Si el motor gira al reves de lo que dice la web, se puede cambiar
+  DIR_DERECHA en el programa (HIGH por LOW) o intercambiar Negro con Verde.
+
+  NUNCA conectar ni desconectar el motor con el driver alimentado: rompe el
+  driver.
+
+
+4. Limite de corriente (potenciometro del DRV8825)
+--------------------------------------------------
+
+  Corriente limite = VREF x 2
+
+  VREF se mide entre el punto "ref" (via marcada en la cara de abajo de la
+  placa, o el propio cursor del potenciometro) y GND, con el driver
+  alimentado y el motor parado.
+
+  Situacion                          Corriente     VREF
+  ---------                          ---------     ----
+  Sin disipador (recomendado)        1,5 A         0,75 V
+  Con disipador y ventilacion        2,0 A         1,00 V   (maximo del motor)
+
+  Sin disipador el DRV8825 no da mas de unos 1,5 A por bobina. El motor
+  tiene par de sobra para empezar con 1,0-1,2 A (VREF 0,50-0,60 V).
+  El driver se calienta hasta quemar al tocarlo.
+
+
+5. Microstepping (opcional)
+---------------------------
+
+  Si se usa, hay que cambiar PULSOS_POR_VUELTA en el programa.
+
+  M0     M1     M2     Resolucion     PULSOS_POR_VUELTA
+  --     --     --     ----------     -----------------
+  -      -      -      completo       200
+  3V3    -      -      1/2            400
+  -      3V3    -      1/4            800
+  3V3    3V3    -      1/8            1600
+  -      -      3V3    1/16           3200
+  3V3    -      3V3    1/32           6400
+
+  (-) = sin conectar
+
+
+6. LED de estado (LED azul de la placa, GPIO 2)
+-----------------------------------------------
+
+  Fijo              conectado a la WiFi de casa
+  Parpadeo rapido   conectando, o se ha perdido la conexion
+  Parpadeo lento    sin router: ha creado su red propia ESP32_MOTOR
+                    (clave 12345678, web en http://192.168.4.1)
+
+
+7. Cargar el programa en esta placa
+-----------------------------------
+
+  Placa "ESP32 Dev Module", puerto COM del CH340.
+  Esta placa no entra sola en modo de carga: mantener pulsado BOOT, pulsar y
+  soltar EN, y seguir con BOOT pulsado hasta que salga "Writing at ...".
+  Arreglo permanente: condensador de 10 uF entre EN y GND.

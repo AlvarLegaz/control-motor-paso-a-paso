@@ -73,6 +73,15 @@
 // aumenta este valor.
 #define PULSO_US            1000
 
+// LED de estado de la WiFi (el LED azul de la placa suele estar en GPIO 2):
+//   parpadeo rapido = sin conexion al router (conectando o se ha perdido)
+//   fijo            = conectado al router
+//   parpadeo lento  = sin router, con la red propia ESP32_MOTOR
+#define LED_PIN             2
+#define LED_ENCENDIDO       HIGH    // cambia a LOW si tu LED se enciende al reves
+#define LED_RAPIDO_MS       200     // medio periodo del parpadeo rapido
+#define LED_LENTO_MS        1000    // medio periodo del parpadeo lento
+
 // Segundos maximos intentando conectar a la WiFi de casa antes de crear la
 // red propia.
 #define TIEMPO_CONEXION_MS  15000
@@ -342,7 +351,29 @@ void paginaNoEncontrada() {
 //  WIFI
 // ---------------------------------------------------------------------
 
+bool modoRouter = false;   // true si se trabaja con la WiFi de casa
+
+// Pone el LED segun el estado de la WiFi. Se llama en cada pasada de loop()
+// y no bloquea.
+void actualizarLed() {
+  static unsigned long ultimoCambio = 0;
+  static bool encendido = false;
+
+  if (modoRouter && WiFi.status() == WL_CONNECTED) {
+    digitalWrite(LED_PIN, LED_ENCENDIDO);          // conectado: fijo
+    encendido = true;
+    return;
+  }
+  unsigned long medioPeriodo = modoRouter ? LED_RAPIDO_MS : LED_LENTO_MS;
+  if (millis() - ultimoCambio >= medioPeriodo) {
+    ultimoCambio = millis();
+    encendido = !encendido;
+    digitalWrite(LED_PIN, encendido ? LED_ENCENDIDO : !LED_ENCENDIDO);
+  }
+}
+
 // Intenta conectar a la WiFi de casa. Devuelve true si lo consigue.
+// Mientras lo intenta, el LED parpadea rapido.
 bool conectarRouter() {
   WiFi.setHostname(NOMBRE_RED);
   WiFi.mode(WIFI_STA);
@@ -350,9 +381,12 @@ bool conectarRouter() {
 
   Serial.print("Conectando a ");
   Serial.print(WIFI_ROUTER_SSID);
+  bool led = false;
   unsigned long inicio = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - inicio < TIEMPO_CONEXION_MS) {
-    delay(500);
+    led = !led;
+    digitalWrite(LED_PIN, led ? LED_ENCENDIDO : !LED_ENCENDIDO);
+    delay(LED_RAPIDO_MS);
     Serial.print(".");
   }
   Serial.println();
@@ -382,12 +416,16 @@ void setup() {
   pinMode(DIR_PIN, OUTPUT);
   digitalWrite(STEP_PIN, LOW);
   digitalWrite(DIR_PIN, DIR_DERECHA);
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, !LED_ENCENDIDO);
 
   Serial.println();
   Serial.println("Control motor paso a paso");
 
   IPAddress ip;
   if (conectarRouter()) {
+    modoRouter = true;
+    digitalWrite(LED_PIN, LED_ENCENDIDO);
     ip = WiFi.localIP();
     Serial.print("Conectado a la WiFi ");
     Serial.println(WIFI_ROUTER_SSID);
@@ -430,4 +468,5 @@ void setup() {
 void loop() {
   server.handleClient();   // atiende la web (no bloquea si no hay peticiones)
   actualizarMotor();       // da el siguiente cambio de STEP si ya toca
+  actualizarLed();         // LED fijo si hay WiFi, parpadeando si no
 }

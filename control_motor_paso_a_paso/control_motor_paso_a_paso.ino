@@ -2,15 +2,19 @@
   CONTROL DE MOTOR PASO A PASO CON ESP32 POR WIFI
   ===============================================
 
-  El ESP32 crea su propia red WiFi (modo Access Point) y sirve una pagina web
-  sencilla para mover un motor paso a paso con un driver de entradas STEP y DIR
-  (A4988, DRV8825, TMC2208, TB6600, DM542...). No necesita router.
+  El ESP32 se conecta a la WiFi de casa y sirve una pagina web sencilla para
+  mover un motor paso a paso con un driver de entradas STEP y DIR (A4988,
+  DRV8825, TMC2208, TB6600, DM542...). Si no consigue conectar al router en
+  TIEMPO_CONEXION_MS, crea su propia red WiFi (modo Access Point) ESP32_MOTOR.
 
   USO
-    1. Cargar este programa en el ESP32 (placa "ESP32 Dev Module").
-    2. Abrir el Monitor Serie a 115200 baudios: muestra la IP (normalmente 192.168.4.1).
-    3. Conectar el movil, tablet o PC a la red WiFi ESP32_MOTOR (clave 12345678).
-    4. Abrir en el navegador http://192.168.4.1
+    1. Poner el nombre y la clave de la WiFi de casa en credenciales.h (hay un
+       ejemplo en credenciales.h.ejemplo). Ese fichero no se sube a GitHub.
+    2. Cargar este programa en el ESP32 (placa "ESP32 Dev Module").
+    3. Abrir el Monitor Serie a 115200 baudios: muestra la IP.
+    4. Con el movil o el PC en la misma WiFi, abrir http://motor.local o la IP.
+       Si el ESP32 creo su propia red: conectarse a ESP32_MOTOR (clave
+       12345678) y abrir http://192.168.4.1
 
   CONEXIONES (con los valores por defecto de abajo)
 
@@ -41,6 +45,14 @@
 
 #include <WiFi.h>
 #include <WebServer.h>
+#include <ESPmDNS.h>     // nombre motor.local (viene con el core ESP32)
+
+// Nombre y clave de la WiFi de casa: WIFI_ROUTER_SSID y WIFI_ROUTER_PASSWORD
+#if __has_include("credenciales.h")
+#include "credenciales.h"
+#else
+#error "Falta credenciales.h: copia credenciales.h.ejemplo como credenciales.h y pon tu WiFi."
+#endif
 
 // =====================================================================
 //  PARAMETROS CONFIGURABLES
@@ -61,8 +73,23 @@
 // aumenta este valor.
 #define PULSO_US            1000
 
+// Segundos maximos intentando conectar a la WiFi de casa antes de crear la
+// red propia.
+#define TIEMPO_CONEXION_MS  15000
+
+// Nombre en la red: la web se abre tambien en http://motor.local
+#define NOMBRE_RED          "motor"
+
+// Red propia (Access Point) si no hay router
 #define WIFI_SSID           "ESP32_MOTOR"
 #define WIFI_PASSWORD       "12345678"   // minimo 8 caracteres
+#define WIFI_CANAL          6            // canal WiFi de 2,4 GHz (1 a 13)
+
+// Potencia de emision de la red propia. En muchas placas clonicas la red no
+// aparece con la potencia maxima porque los picos de consumo hacen caer la
+// tension; con 8,5 dBm se ve bien a varios metros. Otras opciones:
+// WIFI_POWER_11dBm, WIFI_POWER_15dBm, WIFI_POWER_19_5dBm (maxima).
+#define WIFI_POTENCIA       WIFI_POWER_8_5dBm
 
 // Nivel de DIR que corresponde a "derecha". Si el motor gira al reves de lo
 // que indica la web, cambia HIGH por LOW.
@@ -312,6 +339,38 @@ void paginaNoEncontrada() {
 
 
 // ---------------------------------------------------------------------
+//  WIFI
+// ---------------------------------------------------------------------
+
+// Intenta conectar a la WiFi de casa. Devuelve true si lo consigue.
+bool conectarRouter() {
+  WiFi.setHostname(NOMBRE_RED);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_ROUTER_SSID, WIFI_ROUTER_PASSWORD);
+
+  Serial.print("Conectando a ");
+  Serial.print(WIFI_ROUTER_SSID);
+  unsigned long inicio = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - inicio < TIEMPO_CONEXION_MS) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println();
+  return WiFi.status() == WL_CONNECTED;
+}
+
+// Crea la red propia ESP32_MOTOR (modo Access Point).
+void crearRedPropia() {
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_AP);
+  if (!WiFi.softAP(WIFI_SSID, WIFI_PASSWORD, WIFI_CANAL)) {
+    Serial.println("ERROR: no se pudo crear la red WiFi (la clave debe tener al menos 8 caracteres)");
+  }
+  WiFi.setTxPower(WIFI_POTENCIA);
+}
+
+
+// ---------------------------------------------------------------------
 //  SETUP Y LOOP
 // ---------------------------------------------------------------------
 
@@ -324,20 +383,35 @@ void setup() {
   digitalWrite(STEP_PIN, LOW);
   digitalWrite(DIR_PIN, DIR_DERECHA);
 
-  // WiFi en modo Access Point: el ESP32 crea su propia red
-  WiFi.mode(WIFI_AP);
-  if (!WiFi.softAP(WIFI_SSID, WIFI_PASSWORD)) {
-    Serial.println("ERROR: no se pudo crear la red WiFi (la clave debe tener al menos 8 caracteres)");
-  }
-
   Serial.println();
   Serial.println("Control motor paso a paso");
-  Serial.print("Red WiFi: ");
-  Serial.println(WIFI_SSID);
-  Serial.print("IP del Access Point: ");
-  Serial.println(WiFi.softAPIP());
+
+  IPAddress ip;
+  if (conectarRouter()) {
+    ip = WiFi.localIP();
+    Serial.print("Conectado a la WiFi ");
+    Serial.println(WIFI_ROUTER_SSID);
+  } else {
+    Serial.println("No se pudo conectar al router: se crea la red propia");
+    crearRedPropia();
+    ip = WiFi.softAPIP();
+    Serial.print("Red WiFi propia: ");
+    Serial.print(WIFI_SSID);
+    Serial.print(" (clave ");
+    Serial.print(WIFI_PASSWORD);
+    Serial.println(")");
+  }
+
+  Serial.print("IP: ");
+  Serial.println(ip);
   Serial.print("Abre en el navegador: http://");
-  Serial.println(WiFi.softAPIP());
+  Serial.println(ip);
+  if (MDNS.begin(NOMBRE_RED)) {
+    MDNS.addService("http", "tcp", 80);
+    Serial.print("o tambien: http://");
+    Serial.print(NOMBRE_RED);
+    Serial.println(".local");
+  }
   Serial.print("Pulsos por vuelta: ");
   Serial.println(PULSOS_POR_VUELTA);
 

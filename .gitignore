@@ -1,3 +1,6 @@
+# Clave de la WiFi de casa: nunca al repositorio
+credenciales.h
+
 build/
 .vscode/
 *.bin

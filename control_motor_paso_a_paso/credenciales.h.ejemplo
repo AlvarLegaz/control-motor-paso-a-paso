@@ -1,0 +1,6 @@
+// Copia este fichero como credenciales.h (en esta misma carpeta) y pon el
+// nombre y la clave de tu WiFi. credenciales.h no se sube a GitHub.
+// El ESP32 solo se conecta a redes de 2,4 GHz.
+
+#define WIFI_ROUTER_SSID      "NOMBRE_DE_TU_WIFI"
+#define WIFI_ROUTER_PASSWORD  "CLAVE_DE_TU_WIFI"

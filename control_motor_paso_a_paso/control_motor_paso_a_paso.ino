@@ -2,14 +2,15 @@
   CONTROL DE MOTOR PASO A PASO CON ESP32 POR WIFI
   ===============================================
 
-  El ESP32 se conecta a la WiFi de casa y sirve una pagina web sencilla para
-  mover un motor paso a paso con un driver de entradas STEP y DIR (A4988,
-  DRV8825, TMC2208, TB6600, DM542...). Si no consigue conectar al router en
-  TIEMPO_CONEXION_MS, crea su propia red WiFi (modo Access Point) ESP32_MOTOR.
+  El ESP32 se conecta a una WiFi y sirve una pagina web sencilla para mover
+  un motor paso a paso con un driver de entradas STEP y DIR (A4988, DRV8825,
+  TMC2208, TB6600, DM542...). Prueba primero la WiFi de casa y despues una
+  segunda red, cada una durante TIEMPO_CONEXION_MS. Si no conecta a ninguna,
+  crea su propia red WiFi (modo Access Point) ESP32_MOTOR.
 
   USO
-    1. Poner el nombre y la clave de la WiFi de casa en credenciales.h (hay un
-       ejemplo en credenciales.h.ejemplo). Ese fichero no se sube a GitHub.
+    1. Poner nombre y clave de las WiFi en credenciales.h (hay un ejemplo en
+       credenciales.h.ejemplo). Ese fichero no se sube a GitHub.
     2. Cargar este programa en el ESP32 (placa "ESP32 Dev Module").
     3. Abrir el Monitor Serie a 115200 baudios: muestra la IP.
     4. Con el movil o el PC en la misma WiFi, abrir http://motor.local o la IP.
@@ -53,11 +54,16 @@
 #include <ESPmDNS.h>     // nombre motor.local (viene con el core ESP32)
 #include "esp_timer.h"   // temporizador de los pulsos (viene con el core ESP32)
 
-// Nombre y clave de la WiFi de casa: WIFI_ROUTER_SSID y WIFI_ROUTER_PASSWORD
+// Redes WiFi: WIFI_ROUTER_SSID / WIFI_ROUTER_PASSWORD (la primera que se
+// prueba) y WIFI_ROUTER2_SSID / WIFI_ROUTER2_PASSWORD (la segunda, opcional)
 #if __has_include("credenciales.h")
 #include "credenciales.h"
 #else
 #error "Falta credenciales.h: copia credenciales.h.ejemplo como credenciales.h y pon tu WiFi."
+#endif
+#ifndef WIFI_ROUTER2_SSID          // segunda red sin configurar: se salta
+#define WIFI_ROUTER2_SSID     ""
+#define WIFI_ROUTER2_PASSWORD ""
 #endif
 
 // =====================================================================
@@ -439,15 +445,22 @@ void actualizarLed() {
   }
 }
 
-// Intenta conectar a la WiFi de casa. Devuelve true si lo consigue.
-// Mientras lo intenta, el LED parpadea rapido.
-bool conectarRouter() {
-  WiFi.setHostname(NOMBRE_RED);
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_ROUTER_SSID, WIFI_ROUTER_PASSWORD);
+// Redes WiFi que se prueban en orden, con su clave (en credenciales.h).
+// Si no conecta a ninguna, se crea la red propia ESP32_MOTOR.
+const char* REDES_SSID[]  = { WIFI_ROUTER_SSID,     WIFI_ROUTER2_SSID };
+const char* REDES_CLAVE[] = { WIFI_ROUTER_PASSWORD, WIFI_ROUTER2_PASSWORD };
+const int   NUM_REDES = sizeof(REDES_SSID) / sizeof(REDES_SSID[0]);
+const char* redConectada = "";
+
+// Intenta conectar a una red durante TIEMPO_CONEXION_MS. Devuelve true si lo
+// consigue. Mientras lo intenta, el LED parpadea rapido.
+bool conectarRed(const char* ssid, const char* clave) {
+  if (ssid[0] == '\0') return false;   // red sin configurar
+  WiFi.disconnect();
+  WiFi.begin(ssid, clave);
 
   Serial.print("Conectando a ");
-  Serial.print(WIFI_ROUTER_SSID);
+  Serial.print(ssid);
   bool led = false;
   unsigned long inicio = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - inicio < TIEMPO_CONEXION_MS) {
@@ -456,8 +469,21 @@ bool conectarRouter() {
     delay(LED_RAPIDO_MS);
     Serial.print(".");
   }
-  Serial.println();
+  Serial.println(WiFi.status() == WL_CONNECTED ? " conectado" : " no disponible");
   return WiFi.status() == WL_CONNECTED;
+}
+
+// Prueba las redes de REDES_SSID en orden. Devuelve true si conecta a alguna.
+bool conectarRouter() {
+  WiFi.setHostname(NOMBRE_RED);
+  WiFi.mode(WIFI_STA);
+  for (int i = 0; i < NUM_REDES; i++) {
+    if (conectarRed(REDES_SSID[i], REDES_CLAVE[i])) {
+      redConectada = REDES_SSID[i];
+      return true;
+    }
+  }
+  return false;
 }
 
 // Crea la red propia ESP32_MOTOR (modo Access Point).
@@ -512,9 +538,9 @@ void setup() {
     digitalWrite(LED_PIN, LED_ENCENDIDO);
     ip = WiFi.localIP();
     Serial.print("Conectado a la WiFi ");
-    Serial.println(WIFI_ROUTER_SSID);
+    Serial.println(redConectada);
   } else {
-    Serial.println("No se pudo conectar al router: se crea la red propia");
+    Serial.println("No se pudo conectar a ninguna red: se crea la red propia");
     crearRedPropia();
     ip = WiFi.softAPIP();
     Serial.print("Red WiFi propia: ");

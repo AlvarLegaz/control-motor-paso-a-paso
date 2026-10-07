@@ -1,6 +1,6 @@
 # Control motor paso a paso
 
-Programa para ESP32 con Arduino IDE que controla un motor paso a paso desde una página web. El ESP32 se conecta a la WiFi de casa; si no lo consigue en 15 segundos, crea su propia red ESP32_MOTOR en modo Access Point. Funciona con cualquier driver de entradas STEP y DIR: A4988, DRV8825, TMC2208, TB6600, DM542 y similares.
+Programa para ESP32 con Arduino IDE que controla un motor paso a paso desde una página web. El ESP32 prueba primero la WiFi de casa y después una segunda red, 15 segundos cada una. Si no conecta a ninguna, crea su propia red ESP32_MOTOR en modo Access Point. Funciona con cualquier driver de entradas STEP y DIR: A4988, DRV8825, TMC2208, TB6600, DM542 y similares.
 
 El montaje probado usa un ESP32 WROOM-32, un driver Pololu DRV8825 y un motor 17HS19-2004S1. Sus hojas de datos y el detalle de todas las conexiones, el ajuste de corriente y el microstepping están en [docu/readme.txt](docu/readme.txt).
 
@@ -57,7 +57,7 @@ Con `PULSO_US` a 1000 el motor da 500 pasos por segundo, que son 2,5 vueltas por
    https://espressif.github.io/arduino-esp32/package_esp32_index.json
    ```
 
-2. En la carpeta `control_motor_paso_a_paso`, copia `credenciales.h.ejemplo` como `credenciales.h` y pon el nombre y la clave de tu WiFi. El ESP32 solo usa redes de 2,4 GHz. `credenciales.h` está en `.gitignore` y no se sube al repositorio.
+2. En la carpeta `control_motor_paso_a_paso`, copia `credenciales.h.ejemplo` como `credenciales.h` y pon el nombre y la clave de tus WiFi: la primera red que se prueba y, opcionalmente, una segunda. El ESP32 solo usa redes de 2,4 GHz. `credenciales.h` está en `.gitignore` y no se sube al repositorio.
 3. Abre `control_motor_paso_a_paso/control_motor_paso_a_paso.ino`.
 4. Elige la placa "ESP32 Dev Module" y el puerto del ESP32.
 5. Pulsa Subir. Si sale "Wrong boot mode", mantén pulsado BOOT, pulsa y suelta EN, y sigue con BOOT pulsado hasta que salga "Writing at".
@@ -66,9 +66,9 @@ No hace falta instalar ninguna librería: `WiFi.h`, `WebServer.h` y `ESPmDNS.h` 
 
 ## Uso
 
-1. Abre el Monitor Serie a 115200 baudios. Al arrancar dice si se ha conectado a la WiFi de casa y muestra la IP.
-2. Con el móvil o el PC en la misma WiFi, abre en el navegador `http://motor.local` o esa IP.
-3. Si no pudo conectar al router, crea su red propia: conéctate a `ESP32_MOTOR` con la clave `12345678` y abre `http://192.168.4.1`.
+1. Abre el Monitor Serie a 115200 baudios. Al arrancar dice a qué WiFi se ha conectado y muestra la IP.
+2. Con el móvil o el PC en esa misma WiFi, abre en el navegador `http://motor.local` o esa IP.
+3. Si no pudo conectar a ninguna red, crea la suya: conéctate a `ESP32_MOTOR` con la clave `12345678` y abre `http://192.168.4.1`. Con las dos redes configuradas, tarda unos 30 segundos en llegar a este paso.
 
 El LED azul de la placa indica el estado de la WiFi:
 

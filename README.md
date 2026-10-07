@@ -4,11 +4,13 @@ Programa para ESP32 con Arduino IDE que controla un motor paso a paso desde una 
 
 ## Conexiones
 
-| ESP32 | Driver | En drivers optoacoplados, tipo TB6600 |
+| ESP32 WROOM | Driver | En drivers optoacoplados, tipo TB6600 |
 |---|---|---|
-| GPIO 26 | STEP | PUL+ |
-| GPIO 27 | DIR | DIR+ |
+| GPIO 33 (D33) | STEP | PUL+ |
+| GPIO 32 (D32) | DIR | DIR+ |
 | GND | GND lógico | PUL- y DIR- |
+
+En la placa de desarrollo, D33 y D32 están justo al lado de D35 y D34. Los pines D34, D35, D36 (VP) y D39 (VN) no sirven para el driver: en el ESP32 son solo de entrada. El programa no compila si se ponen en `STEP_PIN` o `DIR_PIN`.
 
 - El ESP32 da señales de 3,3 V. A4988, DRV8825 y TMC2208 las aceptan directamente. Algunos drivers optoacoplados necesitan 5 V: si el motor no responde, revisa la hoja del driver.
 - Si el driver tiene entrada ENABLE, déjala habilitada. En el A4988 y el DRV8825 lo está por defecto si no se conecta.
@@ -22,8 +24,8 @@ Todos están al principio de `control_motor_paso_a_paso.ino`:
 
 | Parámetro | Valor inicial | Qué hace |
 |---|---|---|
-| `STEP_PIN` | 26 | GPIO conectado a STEP |
-| `DIR_PIN` | 27 | GPIO conectado a DIR |
+| `STEP_PIN` | 33 | GPIO conectado a STEP |
+| `DIR_PIN` | 32 | GPIO conectado a DIR |
 | `PULSOS_POR_VUELTA` | 200 | Pulsos para una vuelta. Con microstepping se multiplica: 1/8 son 1600, 1/16 son 3200 |
 | `PULSO_US` | 1000 | Microsegundos de STEP en alto y luego en bajo. Un paso dura el doble |
 | `WIFI_SSID` | ESP32_MOTOR | Nombre de la red WiFi |

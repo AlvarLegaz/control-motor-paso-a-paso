@@ -14,11 +14,15 @@
 
   CONEXIONES (con los valores por defecto de abajo)
 
-    ESP32               Driver
+    ESP32 (WROOM)       Driver
     -----               ------
-    GPIO 26  (STEP_PIN) STEP   (en drivers optoacoplados tipo TB6600: PUL+)
-    GPIO 27  (DIR_PIN)  DIR    (en drivers optoacoplados tipo TB6600: DIR+)
+    GPIO 33  (STEP_PIN) STEP   (en drivers optoacoplados tipo TB6600: PUL+)
+    GPIO 32  (DIR_PIN)  DIR    (en drivers optoacoplados tipo TB6600: DIR+)
     GND                 GND logico del driver (en TB6600: PUL- y DIR-)
+
+    En la placa de desarrollo, D33 y D32 estan justo al lado de D35 y D34.
+    NO usar D34, D35, D36 (VP) ni D39 (VN): en el ESP32 son SOLO DE ENTRADA y
+    no pueden dar senal al driver. El programa no compila si se ponen.
 
     - El ESP32 trabaja a 3,3 V. A4988, DRV8825 y TMC2208 aceptan 3,3 V
       directamente. Algunos drivers optoacoplados necesitan 5 V en la entrada:
@@ -42,8 +46,8 @@
 //  PARAMETROS CONFIGURABLES
 // =====================================================================
 
-#define STEP_PIN            26      // GPIO conectado a STEP del driver
-#define DIR_PIN             27      // GPIO conectado a DIR del driver
+#define STEP_PIN            33      // GPIO conectado a STEP del driver (D33)
+#define DIR_PIN             32      // GPIO conectado a DIR del driver  (D32)
 
 // Pulsos que necesita el driver para una vuelta completa del motor.
 // Motor de 200 pasos sin microstepping = 200.
@@ -72,6 +76,11 @@
 #define VUELTAS_MAX         1000
 
 // =====================================================================
+
+// Los GPIO 34 a 39 del ESP32 son solo de entrada: no pueden mover el driver.
+#if (STEP_PIN >= 34 && STEP_PIN <= 39) || (DIR_PIN >= 34 && DIR_PIN <= 39)
+#error "STEP_PIN y DIR_PIN no pueden ser los GPIO 34 a 39: en el ESP32 son solo de entrada. Usa por ejemplo 33 y 32."
+#endif
 
 WebServer server(80);
 

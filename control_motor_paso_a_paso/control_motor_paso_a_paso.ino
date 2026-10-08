@@ -29,7 +29,7 @@
     -----               ------
     GPIO 33  (STEP_PIN) STEP   (en drivers optoacoplados tipo TB6600: PUL+)
     GPIO 32  (DIR_PIN)  DIR    (en drivers optoacoplados tipo TB6600: DIR+)
-    GPIO 26  (ENABLE_PIN) EN   corta la corriente del motor en reposo
+    GPIO 25  (ENABLE_PIN) EN   corta la corriente del motor en reposo
                                (en drivers optoacoplados tipo TB6600: ENA+)
 
     ESP32               Modulo de rele
@@ -84,7 +84,7 @@
 
 #define STEP_PIN            33      // GPIO conectado a STEP del driver (D33)
 #define DIR_PIN             32      // GPIO conectado a DIR del driver  (D32)
-#define ENABLE_PIN          26      // GPIO conectado a EN del driver   (D26)
+#define ENABLE_PIN          25      // GPIO conectado a EN del driver   (D25)
 #define ENABLE_ACTIVO       LOW     // nivel de EN que activa el driver (DRV8825 y A4988: LOW)
 
 // Corriente en reposo. Parado, el driver mantiene las bobinas con corriente
@@ -182,7 +182,7 @@
 
 // Los GPIO 34 a 39 del ESP32 son solo de entrada: no pueden mover el driver.
 #if (STEP_PIN >= 34 && STEP_PIN <= 39) || (DIR_PIN >= 34 && DIR_PIN <= 39) || (ENABLE_PIN >= 34 && ENABLE_PIN <= 39) || (RELE_PIN >= 34 && RELE_PIN <= 39)
-#error "STEP_PIN, DIR_PIN, ENABLE_PIN y RELE_PIN no pueden ser los GPIO 34 a 39: en el ESP32 son solo de entrada. Usa por ejemplo 33, 32, 26 y 27."
+#error "STEP_PIN, DIR_PIN, ENABLE_PIN y RELE_PIN no pueden ser los GPIO 34 a 39: en el ESP32 son solo de entrada. Usa por ejemplo 33, 32, 25 y 27."
 #endif
 
 // El temporizador del ESP32 no admite periodos menores de 50 us.

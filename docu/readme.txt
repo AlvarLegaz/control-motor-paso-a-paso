@@ -22,7 +22,7 @@ Material
                                     Si quedan sueltos el driver NO funciona
                                     (los dos llevan resistencia a masa).
   GND                GND            El GND de la esquina, junto a FLT (masa logica)
-  D25 (GPIO 25)      EN             ENABLE_PIN en el programa. Corta la
+  D26 (GPIO 26)      EN             ENABLE_PIN en el programa. Corta la
                                     corriente del motor cuando lleva parado
                                     REPOSO_MS (500 ms). Sin este cable el
                                     driver queda siempre habilitado y el motor

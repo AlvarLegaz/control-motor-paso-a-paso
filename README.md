@@ -10,7 +10,7 @@ El montaje probado usa un ESP32 WROOM-32, un driver Pololu DRV8825 y un motor 17
 |---|---|---|
 | GPIO 33 (D33) | STEP | PUL+ |
 | GPIO 32 (D32) | DIR | DIR+ |
-| GPIO 25 (D25) | EN | ENA+ |
+| GPIO 26 (D26) | EN | ENA+ |
 | GND | GND lógico | PUL-, DIR- y ENA- |
 
 El módulo de relé va a GPIO 27 (D27) en su entrada IN, con GND común y VCC a 5 V (VIN) o 3,3 V según el módulo. Los detalles están en [docu/readme.txt](docu/readme.txt).
@@ -31,7 +31,7 @@ Todos están al principio de `control_motor_paso_a_paso.ino`:
 |---|---|---|
 | `STEP_PIN` | 33 | GPIO conectado a STEP |
 | `DIR_PIN` | 32 | GPIO conectado a DIR |
-| `ENABLE_PIN` | 25 | GPIO conectado a EN, para cortar la corriente del motor en reposo |
+| `ENABLE_PIN` | 26 | GPIO conectado a EN, para cortar la corriente del motor en reposo |
 | `ENABLE_ACTIVO` | LOW | Nivel de EN que activa el driver. LOW en DRV8825 y A4988 |
 | `DESACTIVAR_EN_REPOSO` | true | Corta la corriente del motor cuando lleva `REPOSO_MS` parado. Pon `false` si una carga puede mover el eje en reposo |
 | `REPOSO_MS` | 500 | Tiempo parado antes de cortar la corriente |

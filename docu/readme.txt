@@ -142,13 +142,34 @@ Material
   (-) = sin conectar
 
 
-6. LED de estado (LED azul de la placa, GPIO 2)
------------------------------------------------
+6. Modos WiFi, boton BOOT y LED (LED azul de la placa, GPIO 2)
+---------------------------------------------------------------
 
-  Fijo              conectado a la WiFi de casa
-  Parpadeo rapido   conectando, o se ha perdido la conexion
-  Parpadeo lento    sin router: ha creado su red propia ESP32_MOTOR
-                    (clave 12345678, web en http://192.168.4.1)
+         ENCENDER
+            |
+            v
+   +------------------+   BOOT (pasados 3 s)   +--------------------+
+   |     MODO AP      | ---------------------> |   BUSCANDO RED     |
+   |  LED parpadeando |                        |  LED parpadeando   |
+   |  ESP32_MOTOR     | <--------------------- |  el doble de rapido|
+   |  192.168.4.1     |   BOOT, o ninguna red  |  casa, luego 2a    |
+   +------------------+                        +--------------------+
+            ^                                            |
+            |                BOOT                        | conecta
+            |                                            v
+            |                                  +--------------------+
+            +--------------------------------- |    MODO HOST       |
+                                               |    LED fijo        |
+                                               |    motor.local     |
+                                               +--------------------+
+
+  - Al encender siempre arranca en modo AP: red ESP32_MOTOR, clave
+    12345678, web en http://192.168.4.1
+  - BOOT no hace nada durante los 3 primeros segundos ni mientras siga
+    pulsado desde el arranque.
+  - Cada cambio de modo PARA EL MOTOR Y APAGA EL RELE.
+  - En modo host, si se cae la WiFi, el LED vuelve a parpadear rapido mientras
+    reconecta solo.
 
 
 7. Cargar el programa en esta placa

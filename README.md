@@ -1,6 +1,6 @@
 # Control motor paso a paso
 
-Programa para ESP32 con Arduino IDE que controla un motor paso a paso desde una página web. El ESP32 prueba primero la WiFi de casa y después una segunda red, 15 segundos cada una. Si no conecta a ninguna, crea su propia red ESP32_MOTOR en modo Access Point. Funciona con cualquier driver de entradas STEP y DIR: A4988, DRV8825, TMC2208, TB6600, DM542 y similares.
+Programa para ESP32 con Arduino IDE que controla un motor paso a paso y un relé desde una página web. Al encender, el ESP32 crea su propia red WiFi, ESP32_MOTOR; con una pulsación del botón BOOT pasa a conectarse a la WiFi de casa. Funciona con cualquier driver de entradas STEP y DIR: A4988, DRV8825, TMC2208, TB6600, DM542 y similares.
 
 El montaje probado usa un ESP32 WROOM-32, un driver Pololu DRV8825 y un motor 17HS19-2004S1. Sus hojas de datos y el detalle de todas las conexiones, el ajuste de corriente y el microstepping están en [docu/readme.txt](docu/readme.txt).
 
@@ -43,9 +43,13 @@ Todos están al principio de `control_motor_paso_a_paso.ino`:
 | `PULSOS_POR_VUELTA` | 200 | Pulsos para una vuelta. Con microstepping se multiplica: 1/8 son 1600, 1/16 son 3200 |
 | `PULSO_US` | 1000 | Microsegundos de STEP en alto y luego en bajo. Un paso dura el doble |
 | `LED_PIN` | 2 | LED de estado de la WiFi, el azul de la placa |
-| `TIEMPO_CONEXION_MS` | 15000 | Tiempo máximo intentando conectar al router |
-| `NOMBRE_RED` | motor | La web se abre también en `http://motor.local` |
-| `WIFI_SSID` | ESP32_MOTOR | Nombre de la red propia, si no hay router |
+| `LED_AP_MS` | 500 | Medio periodo del parpadeo en modo AP. Buscando red parpadea el doble de rápido |
+| `BOTON_MODO_PIN` | 0 | Botón que cambia de modo: el BOOT de la placa |
+| `ARRANQUE_GRACIA_MS` | 3000 | Tiempo tras encender en el que BOOT no hace nada |
+| `ANTIRREBOTE_MS` | 50 | Filtro de rebotes del botón |
+| `TIEMPO_CONEXION_MS` | 15000 | Tiempo máximo intentando conectar a cada red en modo host |
+| `NOMBRE_RED` | motor | En modo host, la web se abre también en `http://motor.local` |
+| `WIFI_SSID` | ESP32_MOTOR | Nombre de la red propia del modo AP |
 | `WIFI_PASSWORD` | 12345678 | Clave de la red propia, de 8 caracteres como mínimo |
 | `WIFI_CANAL` | 6 | Canal de la red propia |
 | `WIFI_POTENCIA` | 8,5 dBm | Potencia de la red propia. Baja porque en placas clónicas la red no aparecía a potencia máxima |
@@ -71,25 +75,61 @@ Con `PULSO_US` a 1000 el motor da 500 pasos por segundo, que son 2,5 vueltas por
 
 No hace falta instalar ninguna librería: `WiFi.h`, `WebServer.h` y `ESPmDNS.h` vienen con el soporte de ESP32.
 
-## Uso
+## Manual de uso: modos WiFi
 
-1. Abre el Monitor Serie a 115200 baudios. Al arrancar dice a qué WiFi se ha conectado y muestra la IP.
-2. Con el móvil o el PC en esa misma WiFi, abre en el navegador `http://motor.local` o esa IP.
-3. Si no pudo conectar a ninguna red, crea la suya: conéctate a `ESP32_MOTOR` con la clave `12345678` y abre `http://192.168.4.1`. Con las dos redes configuradas, tarda unos 30 segundos en llegar a este paso.
+El ESP32 tiene dos modos de red. Se cambia de uno a otro con una pulsación corta del botón **BOOT** de la placa, y el **LED azul** indica en cuál está.
 
-El LED azul de la placa indica el estado de la WiFi:
+```mermaid
+stateDiagram-v2
+    direction TB
+    [*] --> AP: Encender o reiniciar
+    AP: MODO AP · red propia ESP32_MOTOR
+    AP: LED parpadeando
+    AP: Web en http://192.168.4.1
+    BUSCANDO: BUSCANDO RED
+    BUSCANDO: LED parpadeando el doble de rápido
+    BUSCANDO: Prueba la WiFi de casa y luego la segunda, 15 s cada una
+    HOST: MODO HOST · conectado a tu WiFi
+    HOST: LED fijo
+    HOST: Web en http://motor.local o en la IP del Monitor Serie
+    AP --> BUSCANDO: Pulsar BOOT
+    BUSCANDO --> HOST: Conecta a una red
+    BUSCANDO --> AP: No encuentra ninguna
+    BUSCANDO --> AP: Pulsar BOOT
+    HOST --> AP: Pulsar BOOT
+```
 
-| LED | Estado |
-|---|---|
-| Fijo | Conectado a la WiFi de casa |
-| Parpadeo rápido | Conectando, o se ha perdido la conexión |
-| Parpadeo lento | Sin router, con la red propia ESP32_MOTOR |
+**Qué ves y qué puedes hacer:**
+
+| LED | Modo | Para entrar en la web | Si pulsas BOOT |
+|---|---|---|---|
+| Parpadeando | AP: red propia | Conecta el móvil a `ESP32_MOTOR`, clave `12345678`, y abre `http://192.168.4.1` | Pasa a buscar tu WiFi |
+| Parpadeando el doble de rápido | Buscando tu WiFi | No hay web mientras busca | Cancela y vuelve al modo AP |
+| Fijo | Host: conectado a tu WiFi | Con el móvil en tu WiFi, abre `http://motor.local` o la IP que sale en el Monitor Serie | Vuelve al modo AP |
+
+**Paso a paso para usar la WiFi de casa:**
+
+1. Enciende el ESP32 y espera a que el LED parpadee. Está en modo AP.
+2. Espera al menos **3 segundos** desde que lo encendiste. Antes, BOOT no hace nada, para que no cuente si seguía pulsado al encender o al cargar el programa.
+3. Da una **pulsación corta a BOOT**. El LED parpadea el doble de rápido mientras busca.
+4. Si conecta, el LED se queda **fijo**. Abre `http://motor.local` desde un móvil o PC en la misma WiFi.
+5. Si no encuentra ninguna red en unos 30 segundos, vuelve solo al modo AP y el LED parpadea de nuevo.
+
+**Importante:**
+- **Cada cambio de modo para el motor y apaga el relé,** porque en ese momento se pierde la conexión con la página y no podrías pararlos.
+- **Si en modo host se cae la WiFi,** el LED vuelve a parpadear rápido mientras el ESP32 reconecta solo. Al recuperar la red se queda fijo de nuevo.
+- **Las redes y sus claves** están en `credenciales.h`, en el orden en que se prueban.
+- **El Monitor Serie,** a 115200 baudios, va contando cada paso: modo, redes probadas e IP.
+
+## Uso de la página
 
 La página muestra los pulsos por vuelta, un campo para el número de vueltas, los botones de girar a cada lado, los de una vuelta a cada lado y un botón Parar. También muestra si el motor está girando y cuántos pulsos le quedan.
 
 El número de pulsos se calcula como vueltas por `PULSOS_POR_VUELTA`, redondeado al pulso más cercano. Con 200 pulsos por vuelta, 0,5 vueltas son 100 pulsos y 2 vueltas son 400. Admite decimales con punto o con coma.
 
 Mientras el motor gira, las órdenes de mover se rechazan con un aviso. Hay que esperar a que termine o pulsar Parar.
+
+El bloque del relé tiene un campo de tiempo, 1 segundo por defecto, y el botón **Activar relé**: el relé se enciende ese tiempo y se apaga solo. La línea de estado indica si el motor gira o está parado, con o sin corriente, y si el relé está encendido y cuánto le queda.
 
 ## Órdenes HTTP
 

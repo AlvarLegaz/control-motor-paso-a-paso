@@ -2,20 +2,26 @@
   CONTROL DE MOTOR PASO A PASO CON ESP32 POR WIFI
   ===============================================
 
-  El ESP32 se conecta a una WiFi y sirve una pagina web sencilla para mover
-  un motor paso a paso con un driver de entradas STEP y DIR (A4988, DRV8825,
-  TMC2208, TB6600, DM542...). Prueba primero la WiFi de casa y despues una
-  segunda red, cada una durante TIEMPO_CONEXION_MS. Si no conecta a ninguna,
-  crea su propia red WiFi (modo Access Point) ESP32_MOTOR.
+  El ESP32 sirve una pagina web sencilla para mover un motor paso a paso con
+  un driver de entradas STEP y DIR (A4988, DRV8825, TMC2208, TB6600, DM542...).
+
+  MODOS WIFI
+    - Al arrancar crea su propia red ESP32_MOTOR (modo AP), web en
+      http://192.168.4.1. LED parpadeando.
+    - Una pulsacion corta del boton BOOT (pasados ARRANQUE_GRACIA_MS desde el
+      arranque) para el motor y el rele y pasa a modo host: busca la WiFi de
+      casa y despues la segunda red, TIEMPO_CONEXION_MS cada una. LED
+      parpadeando el doble de rapido.
+    - Si conecta: LED fijo, web en http://motor.local o en la IP que sale por
+      el Monitor Serie. Si no conecta a ninguna, vuelve al modo AP.
+    - Otra pulsacion de BOOT para el motor y el rele y vuelve al modo AP.
 
   USO
     1. Poner nombre y clave de las WiFi en credenciales.h (hay un ejemplo en
        credenciales.h.ejemplo). Ese fichero no se sube a GitHub.
     2. Cargar este programa en el ESP32 (placa "ESP32 Dev Module").
-    3. Abrir el Monitor Serie a 115200 baudios: muestra la IP.
-    4. Con el movil o el PC en la misma WiFi, abrir http://motor.local o la IP.
-       Si el ESP32 creo su propia red: conectarse a ESP32_MOTOR (clave
-       12345678) y abrir http://192.168.4.1
+    3. Conectarse a ESP32_MOTOR (clave 12345678) y abrir http://192.168.4.1,
+       o pulsar BOOT para usar la WiFi de casa.
 
   CONEXIONES (con los valores por defecto de abajo)
 
@@ -114,22 +120,28 @@
 #define PULSO_US            1000
 
 // LED de estado de la WiFi (el LED azul de la placa suele estar en GPIO 2):
-//   parpadeo rapido = sin conexion al router (conectando o se ha perdido)
-//   fijo            = conectado al router
-//   parpadeo lento  = sin router, con la red propia ESP32_MOTOR
+//   parpadeo                  = modo AP, red propia ESP32_MOTOR
+//   parpadeo el doble de rapido = modo host buscando red (o conexion perdida)
+//   fijo                      = modo host conectado
 #define LED_PIN             2
 #define LED_ENCENDIDO       HIGH    // cambia a LOW si tu LED se enciende al reves
-#define LED_RAPIDO_MS       200     // medio periodo del parpadeo rapido
-#define LED_LENTO_MS        1000    // medio periodo del parpadeo lento
+#define LED_AP_MS           500     // medio periodo del parpadeo en modo AP
+                                    // (buscando red: la mitad, el doble de rapido)
 
-// Segundos maximos intentando conectar a la WiFi de casa antes de crear la
-// red propia.
+// Boton BOOT de la placa (GPIO 0): una pulsacion corta cambia entre modo AP y
+// modo host. Se ignora durante ARRANQUE_GRACIA_MS tras el arranque y hasta que
+// se vea suelto, para que no cuente si seguia pulsado al encender o al cargar.
+#define BOTON_MODO_PIN      0
+#define ARRANQUE_GRACIA_MS  3000
+#define ANTIRREBOTE_MS      50
+
+// Tiempo maximo intentando conectar a cada red en modo host.
 #define TIEMPO_CONEXION_MS  15000
 
 // Nombre en la red: la web se abre tambien en http://motor.local
 #define NOMBRE_RED          "motor"
 
-// Red propia (Access Point) si no hay router
+// Red propia (modo AP, el de arranque)
 #define WIFI_SSID           "ESP32_MOTOR"
 #define WIFI_PASSWORD       "12345678"   // minimo 8 caracteres
 #define WIFI_CANAL          6            // canal WiFi de 2,4 GHz (1 a 13)
@@ -558,20 +570,29 @@ void cerrarConexionInactiva() {
 //  WIFI
 // ---------------------------------------------------------------------
 
-bool modoRouter = false;   // true si se trabaja con la WiFi de casa
+// Modo de la WiFi
+enum ModoWifi { MODO_AP, MODO_BUSCANDO, MODO_HOST };
+ModoWifi modoWifi = MODO_AP;
 
-// Pone el LED segun el estado de la WiFi. Se llama en cada pasada de loop()
-// y no bloquea.
+// Redes WiFi que se prueban en orden en modo host (claves en credenciales.h).
+const char* REDES_SSID[]  = { WIFI_ROUTER_SSID,     WIFI_ROUTER2_SSID };
+const char* REDES_CLAVE[] = { WIFI_ROUTER_PASSWORD, WIFI_ROUTER2_PASSWORD };
+const int   NUM_REDES = sizeof(REDES_SSID) / sizeof(REDES_SSID[0]);
+int redActual = -1;                 // red que se esta probando
+unsigned long inicioIntento = 0;    // instante (millis) en que empezo a probarla
+
+// Pone el LED segun el modo. Se llama en cada pasada de loop() y no bloquea.
+//   modo AP: parpadeo | buscando o conexion perdida: el doble de rapido | conectado: fijo
 void actualizarLed() {
   static unsigned long ultimoCambio = 0;
   static bool encendido = false;
 
-  if (modoRouter && WiFi.status() == WL_CONNECTED) {
-    digitalWrite(LED_PIN, LED_ENCENDIDO);          // conectado: fijo
+  if (modoWifi == MODO_HOST && WiFi.status() == WL_CONNECTED) {
+    digitalWrite(LED_PIN, LED_ENCENDIDO);
     encendido = true;
     return;
   }
-  unsigned long medioPeriodo = modoRouter ? LED_RAPIDO_MS : LED_LENTO_MS;
+  unsigned long medioPeriodo = (modoWifi == MODO_AP) ? LED_AP_MS : LED_AP_MS / 2;
   if (millis() - ultimoCambio >= medioPeriodo) {
     ultimoCambio = millis();
     encendido = !encendido;
@@ -579,55 +600,116 @@ void actualizarLed() {
   }
 }
 
-// Redes WiFi que se prueban en orden, con su clave (en credenciales.h).
-// Si no conecta a ninguna, se crea la red propia ESP32_MOTOR.
-const char* REDES_SSID[]  = { WIFI_ROUTER_SSID,     WIFI_ROUTER2_SSID };
-const char* REDES_CLAVE[] = { WIFI_ROUTER_PASSWORD, WIFI_ROUTER2_PASSWORD };
-const int   NUM_REDES = sizeof(REDES_SSID) / sizeof(REDES_SSID[0]);
-const char* redConectada = "";
-
-// Intenta conectar a una red durante TIEMPO_CONEXION_MS. Devuelve true si lo
-// consigue. Mientras lo intenta, el LED parpadea rapido.
-bool conectarRed(const char* ssid, const char* clave) {
-  if (ssid[0] == '\0') return false;   // red sin configurar
-  WiFi.disconnect();
-  WiFi.begin(ssid, clave);
-
-  Serial.print("Conectando a ");
-  Serial.print(ssid);
-  bool led = false;
-  unsigned long inicio = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - inicio < TIEMPO_CONEXION_MS) {
-    led = !led;
-    digitalWrite(LED_PIN, led ? LED_ENCENDIDO : !LED_ENCENDIDO);
-    delay(LED_RAPIDO_MS);
-    Serial.print(".");
+// Publica el nombre motor.local en la red actual.
+void iniciarMdns() {
+  MDNS.end();
+  if (MDNS.begin(NOMBRE_RED)) {
+    MDNS.addService("http", "tcp", 80);
   }
-  Serial.println(WiFi.status() == WL_CONNECTED ? " conectado" : " no disponible");
-  return WiFi.status() == WL_CONNECTED;
 }
 
-// Prueba las redes de REDES_SSID en orden. Devuelve true si conecta a alguna.
-bool conectarRouter() {
-  WiFi.setHostname(NOMBRE_RED);
-  WiFi.mode(WIFI_STA);
-  for (int i = 0; i < NUM_REDES; i++) {
-    if (conectarRed(REDES_SSID[i], REDES_CLAVE[i])) {
-      redConectada = REDES_SSID[i];
-      return true;
-    }
-  }
-  return false;
-}
-
-// Crea la red propia ESP32_MOTOR (modo Access Point).
-void crearRedPropia() {
+// Modo AP: crea la red propia ESP32_MOTOR.
+void entrarModoAP() {
   WiFi.disconnect(true);
   WiFi.mode(WIFI_AP);
   if (!WiFi.softAP(WIFI_SSID, WIFI_PASSWORD, WIFI_CANAL)) {
     Serial.println("ERROR: no se pudo crear la red WiFi (la clave debe tener al menos 8 caracteres)");
   }
   WiFi.setTxPower(WIFI_POTENCIA);
+  modoWifi = MODO_AP;
+  iniciarMdns();
+
+  Serial.print("Modo AP: red ");
+  Serial.print(WIFI_SSID);
+  Serial.print(" (clave ");
+  Serial.print(WIFI_PASSWORD);
+  Serial.print("), web en http://");
+  Serial.println(WiFi.softAPIP());
+  Serial.println("Pulsa BOOT para pasar a modo host");
+}
+
+// Empieza a probar la siguiente red de la lista. Si no quedan, vuelve a AP.
+void probarSiguienteRed() {
+  do {
+    redActual++;
+  } while (redActual < NUM_REDES && REDES_SSID[redActual][0] == '\0');  // salta redes sin configurar
+
+  if (redActual >= NUM_REDES) {
+    Serial.println("No se pudo conectar a ninguna red: vuelvo al modo AP");
+    entrarModoAP();
+    return;
+  }
+  Serial.print("Conectando a ");
+  Serial.println(REDES_SSID[redActual]);
+  WiFi.disconnect();
+  WiFi.begin(REDES_SSID[redActual], REDES_CLAVE[redActual]);
+  inicioIntento = millis();
+}
+
+// Modo host: apaga la red propia y empieza a buscar las redes de la lista.
+void empezarBusqueda() {
+  WiFi.softAPdisconnect(true);
+  WiFi.mode(WIFI_OFF);
+  WiFi.setHostname(NOMBRE_RED);
+  WiFi.mode(WIFI_STA);
+  modoWifi = MODO_BUSCANDO;
+  redActual = -1;
+  Serial.println("Modo host: buscando red");
+  probarSiguienteRed();
+}
+
+// Se llama en loop(): sigue la busqueda sin bloquear. Pasa a MODO_HOST al
+// conectar, o a la siguiente red cuando se agota TIEMPO_CONEXION_MS.
+void actualizarWifi() {
+  if (modoWifi != MODO_BUSCANDO) return;
+
+  if (WiFi.status() == WL_CONNECTED) {
+    modoWifi = MODO_HOST;
+    iniciarMdns();
+    Serial.print("Conectado a ");
+    Serial.print(REDES_SSID[redActual]);
+    Serial.print(", web en http://");
+    Serial.print(WiFi.localIP());
+    Serial.print(" o http://");
+    Serial.print(NOMBRE_RED);
+    Serial.println(".local");
+  } else if (millis() - inicioIntento >= TIEMPO_CONEXION_MS) {
+    Serial.print(REDES_SSID[redActual]);
+    Serial.println(" no disponible");
+    probarSiguienteRed();
+  }
+}
+
+// Cambia de modo al pulsar BOOT: de AP a host, o de host (o buscando) a AP.
+// Antes para el motor y apaga el rele, porque se pierde la conexion con la web.
+void cambiarModoWifi() {
+  Serial.println("BOOT pulsado: paro motor y rele y cambio de modo");
+  pararMotor();
+  if (releEncendido) apagarRele();
+  if (modoWifi == MODO_AP) {
+    empezarBusqueda();
+  } else {
+    entrarModoAP();
+  }
+}
+
+// Se llama en loop(): detecta la pulsacion corta de BOOT, con antirrebote.
+// No hace caso hasta pasados ARRANQUE_GRACIA_MS y haber visto el boton suelto.
+void leerBoot() {
+  static bool habilitado = false;
+  static bool pulsadoAntes = false;
+  static unsigned long ultimoCambio = 0;
+
+  bool pulsado = (digitalRead(BOTON_MODO_PIN) == LOW);
+  if (!habilitado) {
+    if (millis() >= ARRANQUE_GRACIA_MS && !pulsado) habilitado = true;
+    return;
+  }
+  if (pulsado != pulsadoAntes && millis() - ultimoCambio >= ANTIRREBOTE_MS) {
+    ultimoCambio = millis();
+    pulsadoAntes = pulsado;
+    if (pulsado) cambiarModoWifi();
+  }
 }
 
 
@@ -671,34 +753,12 @@ void setup() {
   Serial.println();
   Serial.println("Control motor paso a paso");
 
-  IPAddress ip;
-  if (conectarRouter()) {
-    modoRouter = true;
-    digitalWrite(LED_PIN, LED_ENCENDIDO);
-    ip = WiFi.localIP();
-    Serial.print("Conectado a la WiFi ");
-    Serial.println(redConectada);
-  } else {
-    Serial.println("No se pudo conectar a ninguna red: se crea la red propia");
-    crearRedPropia();
-    ip = WiFi.softAPIP();
-    Serial.print("Red WiFi propia: ");
-    Serial.print(WIFI_SSID);
-    Serial.print(" (clave ");
-    Serial.print(WIFI_PASSWORD);
-    Serial.println(")");
-  }
+  // Boton BOOT (en la placa ya tiene resistencia a 3,3 V; se anade la interna)
+  pinMode(BOTON_MODO_PIN, INPUT_PULLUP);
 
-  Serial.print("IP: ");
-  Serial.println(ip);
-  Serial.print("Abre en el navegador: http://");
-  Serial.println(ip);
-  if (MDNS.begin(NOMBRE_RED)) {
-    MDNS.addService("http", "tcp", 80);
-    Serial.print("o tambien: http://");
-    Serial.print(NOMBRE_RED);
-    Serial.println(".local");
-  }
+  // Siempre se arranca en modo AP; BOOT pasa a modo host
+  entrarModoAP();
+
   Serial.print("Pulsos por vuelta: ");
   Serial.println(PULSOS_POR_VUELTA);
 
@@ -716,5 +776,7 @@ void loop() {
   server.handleClient();      // atiende la web
   comprobarFinMovimiento();   // para el temporizador al acabar los pulsos
   comprobarRele();            // apaga el rele cuando acaba su tiempo
-  actualizarLed();            // LED fijo si hay WiFi, parpadeando si no
+  leerBoot();                 // pulsacion de BOOT: cambia entre modo AP y host
+  actualizarWifi();           // sigue la busqueda de red en modo host
+  actualizarLed();            // parpadeo en AP, doble de rapido buscando, fijo conectado
 }

@@ -56,7 +56,7 @@ Todos están al principio de `control_motor_paso_a_paso.ino`:
 | `DIR_DERECHA` | HIGH | Nivel de DIR para girar a la derecha. Cámbialo a LOW si gira al revés |
 | `DIR_SETUP_US` | 5 | Espera entre cambiar DIR y el primer pulso |
 | `VUELTAS_MAX` | 1000 | Máximo de vueltas por orden |
-| `CONEXION_INACTIVA_MS` | 300 | Tiempo que el servidor espera en una conexión que no envía nada antes de cerrarla y atender la siguiente |
+| `CONEXION_INACTIVA_MS` | 300 | Tiempo que una conexión puede estar sin enviar nada antes de cerrarla, y solo si hay otra conexión esperando |
 | `DEPURACION` | true | Muestra en el Monitor Serie quién se conecta, el estado del router y cada petición a la web |
 | `DEPURAR_ESTADO` | false | Muestra también las consultas `/estado` que la página hace cada segundo |
 
@@ -187,7 +187,9 @@ La página usa estas direcciones, que también se pueden llamar desde otro progr
 
 El servidor web del ESP32 atiende una conexión cada vez. Los navegadores abren conexiones por adelantado sin enviar nada, para ganar tiempo en el siguiente clic, y el servidor se quedaba hasta 5 segundos esperando en una de ellas sin atender las demás. Si Parar llegaba en ese momento, esperaba en cola y un movimiento corto terminaba antes.
 
-Ahora `cerrarConexionInactiva()` cierra la conexión en curso si lleva `CONEXION_INACTIVA_MS` abierta sin enviar nada, y el servidor pasa a la siguiente. Además, el botón Parar de la página reintenta el envío hasta 5 veces si falla.
+Ahora `cerrarConexionInactiva()` cierra la conexión en curso si lleva `CONEXION_INACTIVA_MS` sin enviar nada **y hay otra conexión esperando**, y el servidor pasa a la siguiente. Además, el botón Parar de la página reintenta el envío hasta 5 veces si falla.
+
+Una versión anterior cerraba toda conexión vacía a los 300 ms, hubiera o no otra esperando. Eso mataba también peticiones reales cuyos datos llegaban con retraso por un enlace WiFi flojo, y llenaba el Monitor Serie de avisos de conexiones cerradas. Si no hay nadie esperando, la conexión vacía se deja abierta: el navegador la usará para su siguiente petición.
 
 ## Por qué la página tardaba en recuperarse al cambiar de modo
 

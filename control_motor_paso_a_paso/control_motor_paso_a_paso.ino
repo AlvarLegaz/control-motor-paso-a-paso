@@ -166,8 +166,10 @@
 // El servidor web atiende una conexion cada vez. Los navegadores abren
 // conexiones por adelantado sin enviar nada, y el servidor se quedaba hasta
 // 5 s esperando en ellas sin atender las demas (por eso Parar llegaba tarde).
-// Una conexion que no envia nada en este tiempo se cierra para atender la
-// siguiente.
+// Una conexion que lleva este tiempo sin enviar nada se cierra, pero SOLO si
+// hay otra conexion esperando; si no estorba, se la deja en paz (cerrarla
+// sin motivo mataba peticiones reales que llegaban con retraso en enlaces
+// flojos).
 #define CONEXION_INACTIVA_MS 300
 
 // Depuracion por el Monitor Serie (115200 baudios): dispositivos que se
@@ -190,7 +192,14 @@
 #error "PULSO_US debe ser de 50 microsegundos o mas."
 #endif
 
-WebServer server(80);
+// Servidor web con una consulta extra: si hay otra conexion esperando a ser
+// atendida. Sirve para cerrar una conexion vacia SOLO cuando estorba.
+class ServidorWeb : public WebServer {
+public:
+  ServidorWeb(uint16_t puerto) : WebServer(puerto) {}
+  bool hayOtraEsperando() { return _server.hasClient(); }
+};
+ServidorWeb server(80);
 
 // Estado del movimiento. moverMotor() lo prepara y el temporizador da los
 // pulsos. 'volatile' porque el temporizador corre en otra tarea del ESP32.
@@ -655,9 +664,10 @@ void paginaNoEncontrada() {
   responder(404, "text/plain; charset=utf-8", "No encontrado");
 }
 
-// Cierra la conexion en curso si lleva CONEXION_INACTIVA_MS abierta sin
-// enviar nada, para que el servidor pase a la siguiente (por ejemplo, Parar).
-// Se llama en loop() antes de server.handleClient().
+// Cierra la conexion en curso si lleva CONEXION_INACTIVA_MS sin enviar nada
+// Y hay otra conexion esperando (por ejemplo, Parar). Si no hay nadie
+// esperando, la deja abierta: el navegador la usara para su siguiente
+// peticion. Se llama en loop() antes de server.handleClient().
 void cerrarConexionInactiva() {
   static bool vigilando = false;
   static unsigned long desde = 0;
@@ -667,9 +677,10 @@ void cerrarConexionInactiva() {
     if (!vigilando) {
       vigilando = true;
       desde = millis();
-    } else if (millis() - desde > CONEXION_INACTIVA_MS) {
+    } else if (millis() - desde > CONEXION_INACTIVA_MS && server.hayOtraEsperando()) {
       depurar(String("[web] conexion de ") + cliente.remoteIP().toString() +
-              " cerrada: no envio nada en " + String(CONEXION_INACTIVA_MS) + " ms");
+              " cerrada: llevaba " + String(millis() - desde) +
+              " ms sin enviar nada y hay otra esperando");
       cliente.stop();
       vigilando = false;
     }

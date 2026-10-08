@@ -166,10 +166,8 @@
 // El servidor web atiende una conexion cada vez. Los navegadores abren
 // conexiones por adelantado sin enviar nada, y el servidor se quedaba hasta
 // 5 s esperando en ellas sin atender las demas (por eso Parar llegaba tarde).
-// Una conexion que lleva este tiempo sin enviar nada se cierra, pero SOLO si
-// hay otra conexion esperando; si no estorba, se la deja en paz (cerrarla
-// sin motivo mataba peticiones reales que llegaban con retraso en enlaces
-// flojos).
+// Una conexion que no envia nada en este tiempo se cierra para atender la
+// siguiente.
 #define CONEXION_INACTIVA_MS 300
 
 // Depuracion por el Monitor Serie (115200 baudios): dispositivos que se
@@ -192,14 +190,7 @@
 #error "PULSO_US debe ser de 50 microsegundos o mas."
 #endif
 
-// Servidor web con una consulta extra: si hay otra conexion esperando a ser
-// atendida. Sirve para cerrar una conexion vacia SOLO cuando estorba.
-class ServidorWeb : public WebServer {
-public:
-  ServidorWeb(uint16_t puerto) : WebServer(puerto) {}
-  bool hayOtraEsperando() { return _server.hasClient(); }
-};
-ServidorWeb server(80);
+WebServer server(80);
 
 // Estado del movimiento. moverMotor() lo prepara y el temporizador da los
 // pulsos. 'volatile' porque el temporizador corre en otra tarea del ESP32.
@@ -484,21 +475,9 @@ const char PAGINA[] PROGMEM = R"rawliteral(
   </div>
 
 <script>
-  // Peticion con tope de tiempo. Sin el, una peticion a un ESP32 que no
-  // responde (por ejemplo, justo despues de cambiar de modo) se queda colgada
-  // un minuto y bloquea las siguientes: el navegador solo admite unas pocas
-  // conexiones a la vez con el mismo servidor.
-  var TOPE_MS = 3000;
-  function pedir(url) {
-    var control = new AbortController();
-    var temporizador = setTimeout(() => control.abort(), TOPE_MS);
-    return fetch(url, { signal: control.signal, cache: 'no-store' })
-      .finally(() => clearTimeout(temporizador));
-  }
-
   // Envia una orden al ESP32 y muestra su respuesta
   function orden(url) {
-    pedir(url)
+    fetch(url)
       .then(r => r.text())
       .then(t => { document.getElementById('mensaje').textContent = t; })
       .catch(() => { document.getElementById('mensaje').textContent = 'Sin conexión con el ESP32'; });
@@ -514,7 +493,7 @@ const char PAGINA[] PROGMEM = R"rawliteral(
 
   // Orden de parar. Si no llega al ESP32, se reintenta hasta 'intentos' veces.
   function parar(intentos) {
-    pedir('/parar')
+    fetch('/parar')
       .then(r => r.text())
       .then(t => { document.getElementById('mensaje').textContent = t; })
       .catch(() => {
@@ -529,13 +508,9 @@ const char PAGINA[] PROGMEM = R"rawliteral(
     orden('/rele?segundos=' + encodeURIComponent(s));
   }
 
-  // Consulta el estado del motor cada segundo. Si la anterior aun no ha
-  // contestado, no se lanza otra, para no acumular peticiones.
-  var consultando = false;
+  // Consulta el estado del motor cada segundo
   function leerEstado() {
-    if (consultando) return;
-    consultando = true;
-    pedir('/estado')
+    fetch('/estado')
       .then(r => r.json())
       .then(e => {
         document.getElementById('estado').textContent = e.moviendo
@@ -545,8 +520,7 @@ const char PAGINA[] PROGMEM = R"rawliteral(
           ? 'encendido, quedan ' + (e.rele_ms_restantes / 1000).toFixed(1) + ' s'
           : 'apagado';
       })
-      .catch(() => { document.getElementById('estado').textContent = 'sin conexión'; })
-      .finally(() => { consultando = false; });
+      .catch(() => { document.getElementById('estado').textContent = 'sin conexión'; });
   }
   setInterval(leerEstado, 1000);
   leerEstado();
@@ -664,10 +638,9 @@ void paginaNoEncontrada() {
   responder(404, "text/plain; charset=utf-8", "No encontrado");
 }
 
-// Cierra la conexion en curso si lleva CONEXION_INACTIVA_MS sin enviar nada
-// Y hay otra conexion esperando (por ejemplo, Parar). Si no hay nadie
-// esperando, la deja abierta: el navegador la usara para su siguiente
-// peticion. Se llama en loop() antes de server.handleClient().
+// Cierra la conexion en curso si lleva CONEXION_INACTIVA_MS abierta sin
+// enviar nada, para que el servidor pase a la siguiente (por ejemplo, Parar).
+// Se llama en loop() antes de server.handleClient().
 void cerrarConexionInactiva() {
   static bool vigilando = false;
   static unsigned long desde = 0;
@@ -677,10 +650,9 @@ void cerrarConexionInactiva() {
     if (!vigilando) {
       vigilando = true;
       desde = millis();
-    } else if (millis() - desde > CONEXION_INACTIVA_MS && server.hayOtraEsperando()) {
+    } else if (millis() - desde > CONEXION_INACTIVA_MS) {
       depurar(String("[web] conexion de ") + cliente.remoteIP().toString() +
-              " cerrada: llevaba " + String(millis() - desde) +
-              " ms sin enviar nada y hay otra esperando");
+              " cerrada: no envio nada en " + String(CONEXION_INACTIVA_MS) + " ms");
       cliente.stop();
       vigilando = false;
     }
@@ -724,51 +696,16 @@ void actualizarLed() {
   }
 }
 
-// El nombre motor.local solo se publica en modo host. En modo AP la IP es
-// siempre 192.168.4.1 y no hace falta; y si se publicara el mismo nombre en
-// las dos redes, el movil se quedaria hasta 2 minutos con la IP antigua tras
-// cambiar de modo y tardaria eso en volver a cargar la pagina.
-bool mdnsActivo = false;
-
-void publicarNombre() {
+// Publica el nombre motor.local en la red actual.
+void iniciarMdns() {
+  MDNS.end();
   if (MDNS.begin(NOMBRE_RED)) {
     MDNS.addService("http", "tcp", 80);
-    mdnsActivo = true;
   }
-}
-
-// Retira el nombre avisando a la red ANTES de apagarla, para que el movil
-// olvide la IP antigua en el acto.
-void retirarNombre() {
-  if (!mdnsActivo) return;
-  MDNS.end();
-  mdnsActivo = false;
-  delay(50);   // tiempo para que salga el aviso de baja por la red
-}
-
-// El servidor web se para antes de cambiar de red y se arranca despues, para
-// no arrastrar conexiones de la red anterior.
-bool servidorArrancado = false;
-
-void arrancarServidor() {
-  server.begin();
-  servidorArrancado = true;
-}
-
-void pararServidor() {
-  if (servidorArrancado) server.stop();
-  servidorArrancado = false;
-}
-
-void reiniciarServidor() {
-  pararServidor();
-  arrancarServidor();
 }
 
 // Modo AP: crea la red propia ESP32_MOTOR.
 void entrarModoAP() {
-  retirarNombre();
-  pararServidor();
   WiFi.disconnect(true);
   WiFi.mode(WIFI_AP);
   if (!WiFi.softAP(WIFI_SSID, WIFI_PASSWORD, WIFI_CANAL)) {
@@ -776,7 +713,7 @@ void entrarModoAP() {
   }
   WiFi.setTxPower(WIFI_POTENCIA);
   modoWifi = MODO_AP;
-  arrancarServidor();
+  iniciarMdns();
 
   aviso(String("[wifi] modo AP: red ") + WIFI_SSID + " (clave " + WIFI_PASSWORD +
         "), web en http://" + WiFi.softAPIP().toString());
@@ -803,13 +740,10 @@ void probarSiguienteRed() {
 
 // Modo host: apaga la red propia y empieza a buscar las redes de la lista.
 void empezarBusqueda() {
-  pararServidor();
   WiFi.softAPdisconnect(true);
   WiFi.mode(WIFI_OFF);
   WiFi.setHostname(NOMBRE_RED);
   WiFi.mode(WIFI_STA);
-  WiFi.setSleep(false);   // sin ahorro de energia: la web responde sin esperas
-  arrancarServidor();
   modoWifi = MODO_BUSCANDO;
   redActual = -1;
   aviso("[wifi] modo host: buscando red");
@@ -823,8 +757,7 @@ void actualizarWifi() {
 
   if (WiFi.status() == WL_CONNECTED) {
     modoWifi = MODO_HOST;
-    reiniciarServidor();
-    publicarNombre();
+    iniciarMdns();
     aviso(String("[wifi] conectado a ") + REDES_SSID[redActual] + ", web en http://" +
           WiFi.localIP().toString() + " o http://" + NOMBRE_RED + ".local");
   } else if (millis() - inicioIntento >= TIEMPO_CONEXION_MS) {
@@ -912,19 +845,19 @@ void setup() {
   // Avisos de WiFi por el Monitor Serie (quien se conecta, router...)
   WiFi.onEvent(eventoWifi);
 
-  // Rutas de la web (el servidor lo arranca cada modo al activar su red)
+  // Siempre se arranca en modo AP; BOOT pasa a modo host
+  entrarModoAP();
+
+  Serial.print("Pulsos por vuelta: ");
+  Serial.println(PULSOS_POR_VUELTA);
+
   server.on("/", HTTP_GET, paginaPrincipal);
   server.on("/mover", HTTP_GET, ordenMover);
   server.on("/parar", HTTP_GET, ordenParar);
   server.on("/estado", HTTP_GET, ordenEstado);
   server.on("/rele", HTTP_GET, ordenRele);
   server.onNotFound(paginaNoEncontrada);
-
-  // Siempre se arranca en modo AP; BOOT pasa a modo host
-  entrarModoAP();
-
-  Serial.print("Pulsos por vuelta: ");
-  Serial.println(PULSOS_POR_VUELTA);
+  server.begin();
 }
 
 void loop() {

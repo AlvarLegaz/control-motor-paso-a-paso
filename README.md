@@ -56,7 +56,7 @@ Todos están al principio de `control_motor_paso_a_paso.ino`:
 | `DIR_DERECHA` | HIGH | Nivel de DIR para girar a la derecha. Cámbialo a LOW si gira al revés |
 | `DIR_SETUP_US` | 5 | Espera entre cambiar DIR y el primer pulso |
 | `VUELTAS_MAX` | 1000 | Máximo de vueltas por orden |
-| `CONEXION_INACTIVA_MS` | 300 | Tiempo que una conexión puede estar sin enviar nada antes de cerrarla, y solo si hay otra conexión esperando |
+| `CONEXION_INACTIVA_MS` | 300 | Tiempo que el servidor espera en una conexión que no envía nada antes de cerrarla y atender la siguiente |
 | `DEPURACION` | true | Muestra en el Monitor Serie quién se conecta, el estado del router y cada petición a la web |
 | `DEPURAR_ESTADO` | false | Muestra también las consultas `/estado` que la página hace cada segundo |
 
@@ -118,8 +118,6 @@ stateDiagram-v2
 5. Si no encuentra ninguna red en unos 30 segundos, vuelve solo al modo AP y el LED parpadea de nuevo.
 
 **Importante:**
-- **En modo AP entra siempre por `http://192.168.4.1`.** El nombre `motor.local` solo existe en modo host. Si se anunciara en las dos redes, el móvil guardaría la IP antigua hasta 2 minutos después de cambiar de modo y la página tardaría eso en volver a cargar.
-- **Tras cambiar de modo, dale unos segundos al móvil** para que se cambie de red él también. La página abierta marca "sin conexión" mientras tanto y se recupera sola.
 - **Cada cambio de modo para el motor y apaga el relé,** porque en ese momento se pierde la conexión con la página y no podrías pararlos.
 - **Si en modo host se cae la WiFi,** el LED vuelve a parpadear rápido mientras el ESP32 reconecta solo. Al recuperar la red se queda fijo de nuevo.
 - **Las redes y sus claves** están en `credenciales.h`, en el orden en que se prueban.
@@ -187,17 +185,7 @@ La página usa estas direcciones, que también se pueden llamar desde otro progr
 
 El servidor web del ESP32 atiende una conexión cada vez. Los navegadores abren conexiones por adelantado sin enviar nada, para ganar tiempo en el siguiente clic, y el servidor se quedaba hasta 5 segundos esperando en una de ellas sin atender las demás. Si Parar llegaba en ese momento, esperaba en cola y un movimiento corto terminaba antes.
 
-Ahora `cerrarConexionInactiva()` cierra la conexión en curso si lleva `CONEXION_INACTIVA_MS` sin enviar nada **y hay otra conexión esperando**, y el servidor pasa a la siguiente. Además, el botón Parar de la página reintenta el envío hasta 5 veces si falla.
-
-Una versión anterior cerraba toda conexión vacía a los 300 ms, hubiera o no otra esperando. Eso mataba también peticiones reales cuyos datos llegaban con retraso por un enlace WiFi flojo, y llenaba el Monitor Serie de avisos de conexiones cerradas. Si no hay nadie esperando, la conexión vacía se deja abierta: el navegador la usará para su siguiente petición.
-
-## Por qué la página tardaba en recuperarse al cambiar de modo
-
-Al cambiar de modo, el ESP32 cambia de red y de IP, y el móvil tarda en enterarse. Tres cosas alargaban ese rato hasta medio minuto o un minuto, y se han corregido:
-
-- **El nombre `motor.local` apuntaba a la IP antigua.** Se anunciaba en las dos redes y el móvil lo guarda 2 minutos. Ahora solo se anuncia en modo host, y al salir de ese modo se retira avisando a la red antes de apagarla.
-- **Las consultas de estado se acumulaban.** La página pedía `/estado` cada segundo sin límite de tiempo; con el ESP32 fuera de alcance se quedaban colgadas y ocupaban las pocas conexiones que el navegador permite, así que los clics esperaban detrás. Ahora cada petición tiene un tope de 3 segundos y no se lanza una consulta si la anterior sigue pendiente.
-- **El servidor web y el ahorro de energía.** El servidor se reinicia en cada cambio de red para no arrastrar conexiones viejas, y en modo host se desactiva el ahorro de energía del WiFi, que añadía una espera a cada petición.
+Ahora `cerrarConexionInactiva()` cierra la conexión en curso si lleva `CONEXION_INACTIVA_MS` abierta sin enviar nada, y el servidor pasa a la siguiente. Además, el botón Parar de la página reintenta el envío hasta 5 veces si falla.
 
 ## Cómo se generan los pulsos
 

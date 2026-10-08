@@ -62,9 +62,10 @@
 */
 
 #include <WiFi.h>
-#include <WebServer.h>
-#include <ESPmDNS.h>     // nombre motor.local (viene con el core ESP32)
-#include "esp_timer.h"   // temporizador de los pulsos (viene con el core ESP32)
+#include <ESPmDNS.h>          // nombre motor.local (viene con el core ESP32)
+#include "esp_timer.h"        // temporizador de los pulsos (viene con el core ESP32)
+#include "esp_http_server.h"  // servidor web del sistema del ESP32 (viene con el core)
+#include "lwip/sockets.h"     // para saber la IP de quien hace cada peticion
 
 // Redes WiFi: WIFI_ROUTER_SSID / WIFI_ROUTER_PASSWORD (la primera que se
 // prueba) y WIFI_ROUTER2_SSID / WIFI_ROUTER2_PASSWORD (la segunda, opcional)
@@ -163,12 +164,10 @@
 // Limite de vueltas por orden, para evitar errores al teclear.
 #define VUELTAS_MAX         1000
 
-// El servidor web atiende una conexion cada vez. Los navegadores abren
-// conexiones por adelantado sin enviar nada, y el servidor se quedaba hasta
-// 5 s esperando en ellas sin atender las demas (por eso Parar llegaba tarde).
-// Una conexion que no envia nada en este tiempo se cierra para atender la
-// siguiente.
-#define CONEXION_INACTIVA_MS 300
+// Servidor web: el del sistema del ESP32 (esp_http_server). Atiende varias
+// conexiones a la vez en su propia tarea, y cuando se llena cierra la menos
+// usada para dejar entrar a la nueva (lo que pasa al recargar la pagina).
+#define WEB_MAX_CONEXIONES  7       // conexiones abiertas a la vez como maximo
 
 // Depuracion por el Monitor Serie (115200 baudios): dispositivos que se
 // conectan a la red propia, conexion con el router y cada peticion a la web,
@@ -190,7 +189,12 @@
 #error "PULSO_US debe ser de 50 microsegundos o mas."
 #endif
 
-WebServer server(80);
+httpd_handle_t servidor = NULL;
+
+// La web se atiende en la tarea del servidor y el resto (fin de movimiento,
+// rele, boton, WiFi) en loop(). Este candado evita que las dos toquen el
+// estado del motor y del rele a la vez.
+SemaphoreHandle_t candadoEstado;
 
 // Estado del movimiento. moverMotor() lo prepara y el temporizador da los
 // pulsos. 'volatile' porque el temporizador corre en otra tarea del ESP32.
@@ -274,29 +278,59 @@ void eventoWifi(arduino_event_id_t evento, arduino_event_info_t info) {
   }
 }
 
+// IP de quien hace la peticion. El servidor escucha en IPv6 e IPv4 a la vez,
+// asi que una IP v4 llega como ::ffff:a.b.c.d y se saca de los 4 ultimos bytes.
+String ipCliente(httpd_req_t* req) {
+  struct sockaddr_storage dir;
+  socklen_t largo = sizeof(dir);
+  if (getpeername(httpd_req_to_sockfd(req), (struct sockaddr*)&dir, &largo) != 0) return "?";
+  if (dir.ss_family == AF_INET) {
+    return IPAddress(((struct sockaddr_in*)&dir)->sin_addr.s_addr).toString();
+  }
+  if (dir.ss_family == AF_INET6) {
+    const uint8_t* b = ((struct sockaddr_in6*)&dir)->sin6_addr.s6_addr;
+    return IPAddress(b[12], b[13], b[14], b[15]).toString();
+  }
+  return "?";
+}
+
+// Valor de un parametro de la direccion (?vueltas=1.5&...). Vacio si no esta.
+String argumento(httpd_req_t* req, const char* nombre) {
+  char consulta[128];
+  char valor[32];
+  if (httpd_req_get_url_query_str(req, consulta, sizeof(consulta)) != ESP_OK) return "";
+  if (httpd_query_key_value(consulta, nombre, valor, sizeof(valor)) != ESP_OK) return "";
+  return String(valor);
+}
+
 // Envia la respuesta de la web y la anota: IP de quien pregunta, orden y
 // codigo de respuesta (con el texto, si es corto).
-void responder(int codigo, const char* tipo, const String& cuerpo) {
-  server.send(codigo, tipo, cuerpo);
+esp_err_t responder(httpd_req_t* req, int codigo, const char* tipo, const String& cuerpo) {
+  const char* estado = "200 OK";
+  if (codigo == 400) estado = "400 Bad Request";
+  else if (codigo == 404) estado = "404 Not Found";
+  else if (codigo == 409) estado = "409 Conflict";
+  httpd_resp_set_status(req, estado);
+  httpd_resp_set_type(req, tipo);
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+  esp_err_t resultado = httpd_resp_send(req, cuerpo.c_str(), cuerpo.length());
 
-  bool esEstado = (server.uri() == "/estado");
-  if (!DEPURACION || (esEstado && !DEPURAR_ESTADO && codigo == 200)) return;
+  bool esEstado = (strncmp(req->uri, "/estado", 7) == 0);
+  if (!DEPURACION || (esEstado && !DEPURAR_ESTADO && codigo == 200)) return resultado;
 
   String linea = "[web] ";
-  linea += server.client().remoteIP().toString();
-  linea += (server.method() == HTTP_GET) ? " GET " : " otro ";
-  linea += server.uri();
-  for (int i = 0; i < server.args(); i++) {
-    linea += (i == 0) ? "?" : "&";
-    linea += server.argName(i) + "=" + server.arg(i);
-  }
+  linea += ipCliente(req);
+  linea += (req->method == HTTP_GET) ? " GET " : " otro ";
+  linea += req->uri;
   linea += " -> ";
   linea += codigo;
   if (String(tipo).startsWith("text/plain")) {
     linea += " ";
     linea += cuerpo.length() > 70 ? cuerpo.substring(0, 70) + "..." : cuerpo;
   }
+  if (resultado != ESP_OK) linea += " (no se pudo enviar: el navegador ya habia cerrado)";
   depurar(linea);
+  return resultado;
 }
 
 
@@ -534,131 +568,153 @@ const char PAGINA[] PROGMEM = R"rawliteral(
 //  RESPUESTAS HTTP
 // ---------------------------------------------------------------------
 
+// Cada manejador corre en la tarea del servidor web. Toma candadoEstado solo
+// mientras lee o cambia el estado del motor y del rele, y lo suelta ANTES de
+// enviar la respuesta: asi un envio lento a un movil con mala cobertura nunca
+// frena el bucle principal ni el motor.
+
 // GET /  -> pagina de control
-void paginaPrincipal() {
+esp_err_t paginaPrincipal(httpd_req_t* req) {
   String html = PAGINA;
   html.replace("%PPV%", String(PULSOS_POR_VUELTA));
   html.replace("%RELE_S%", String(RELE_TIEMPO_S));
-  responder(200, "text/html; charset=utf-8", html);
+  return responder(req, 200, "text/html; charset=utf-8", html);
 }
 
 // GET /mover?vueltas=1.5&sentido=der  (sentido: der o izq)
-void ordenMover() {
-  if (pulsosPendientes > 0) {
-    responder(409, "text/plain; charset=utf-8",
-                "El motor está girando. Espera a que termine o pulsa Parar.");
-    return;
-  }
-
-  String textoVueltas = server.arg("vueltas");
+esp_err_t ordenMover(httpd_req_t* req) {
+  String textoVueltas = argumento(req, "vueltas");
   textoVueltas.replace(",", ".");          // admite 0,5 ademas de 0.5
+  textoVueltas.replace("%2C", ".");        // la coma puede llegar codificada
   float vueltas = textoVueltas.toFloat();
-  String sentido = server.arg("sentido");
+  String sentido = argumento(req, "sentido");
 
   if (vueltas <= 0 || vueltas > VUELTAS_MAX) {
     String error = "Número de vueltas no válido (entre 0 y ";
     error += VUELTAS_MAX;
     error += ").";
-    responder(400, "text/plain; charset=utf-8", error);
-    return;
+    return responder(req, 400, "text/plain; charset=utf-8", error);
   }
   if (sentido != "der" && sentido != "izq") {
-    responder(400, "text/plain; charset=utf-8", "Sentido no válido.");
-    return;
+    return responder(req, 400, "text/plain; charset=utf-8", "Sentido no válido.");
   }
 
   // pulsos = vueltas * PULSOS_POR_VUELTA, redondeado al pulso mas cercano
   long pulsos = (long)(vueltas * PULSOS_POR_VUELTA + 0.5f);
   if (pulsos < 1) {
-    responder(400, "text/plain; charset=utf-8", "Son menos de un pulso.");
-    return;
+    return responder(req, 400, "text/plain; charset=utf-8", "Son menos de un pulso.");
   }
 
   bool derecha = (sentido == "der");
-  moverMotor(pulsos, derecha);
+  bool ocupado;
+  xSemaphoreTake(candadoEstado, portMAX_DELAY);
+  ocupado = (pulsosPendientes > 0);
+  if (!ocupado) moverMotor(pulsos, derecha);
+  xSemaphoreGive(candadoEstado);
 
+  if (ocupado) {
+    return responder(req, 409, "text/plain; charset=utf-8",
+                     "El motor está girando. Espera a que termine o pulsa Parar.");
+  }
   String mensaje = "Girando ";
   mensaje += String(vueltas, 2);
   mensaje += derecha ? " vueltas a la derecha (" : " vueltas a la izquierda (";
   mensaje += pulsos;
   mensaje += " pulsos)";
-  responder(200, "text/plain; charset=utf-8", mensaje);
+  return responder(req, 200, "text/plain; charset=utf-8", mensaje);
 }
 
 // GET /parar
-void ordenParar() {
+esp_err_t ordenParar(httpd_req_t* req) {
+  xSemaphoreTake(candadoEstado, portMAX_DELAY);
   pararMotor();
-  responder(200, "text/plain; charset=utf-8", "Motor parado.");
+  xSemaphoreGive(candadoEstado);
+  return responder(req, 200, "text/plain; charset=utf-8", "Motor parado.");
 }
 
 // GET /rele?segundos=1.5  -> enciende el rele 1,5 s y luego se apaga solo
-void ordenRele() {
-  String texto = server.arg("segundos");
+esp_err_t ordenRele(httpd_req_t* req) {
+  String texto = argumento(req, "segundos");
   texto.replace(",", ".");
+  texto.replace("%2C", ".");
   float segundos = texto.toFloat();
   if (segundos <= 0 || segundos > RELE_MAX_S) {
     String error = "Tiempo del relé no válido (entre 0 y ";
     error += RELE_MAX_S;
     error += " segundos).";
-    responder(400, "text/plain; charset=utf-8", error);
-    return;
+    return responder(req, 400, "text/plain; charset=utf-8", error);
   }
   unsigned long ms = (unsigned long)(segundos * 1000 + 0.5f);
+  xSemaphoreTake(candadoEstado, portMAX_DELAY);
   encenderRele(ms);
+  xSemaphoreGive(candadoEstado);
 
   String mensaje = "Relé encendido ";
   mensaje += String(segundos, 1);
   mensaje += " s";
-  responder(200, "text/plain; charset=utf-8", mensaje);
+  return responder(req, 200, "text/plain; charset=utf-8", mensaje);
 }
 
 // GET /estado  -> {"moviendo":true,"pulsos_pendientes":120,"sentido":"derecha",
 //                  "pulsos_por_vuelta":200,"con_corriente":true,"rele":false,"rele_ms_restantes":0}
-void ordenEstado() {
+esp_err_t ordenEstado(httpd_req_t* req) {
+  xSemaphoreTake(candadoEstado, portMAX_DELAY);
+  long pendientes = pulsosPendientes;
+  bool derecha = sentidoDerecha;
+  bool conCorriente = driverActivo;
+  bool rele = releEncendido;
+  unsigned long transcurrido = millis() - releInicio;
+  unsigned long restante = (rele && transcurrido < releDuracionMs) ? releDuracionMs - transcurrido : 0;
+  xSemaphoreGive(candadoEstado);
+
   String json = "{\"moviendo\":";
-  json += (pulsosPendientes > 0) ? "true" : "false";
+  json += (pendientes > 0) ? "true" : "false";
   json += ",\"pulsos_pendientes\":";
-  json += pulsosPendientes;
+  json += pendientes;
   json += ",\"sentido\":\"";
-  json += sentidoDerecha ? "derecha" : "izquierda";
+  json += derecha ? "derecha" : "izquierda";
   json += "\",\"pulsos_por_vuelta\":";
   json += PULSOS_POR_VUELTA;
   json += ",\"con_corriente\":";
-  json += driverActivo ? "true" : "false";
+  json += conCorriente ? "true" : "false";
   json += ",\"rele\":";
-  json += releEncendido ? "true" : "false";
+  json += rele ? "true" : "false";
   json += ",\"rele_ms_restantes\":";
-  unsigned long transcurrido = millis() - releInicio;
-  json += (releEncendido && transcurrido < releDuracionMs) ? releDuracionMs - transcurrido : 0;
+  json += restante;
   json += "}";
-  responder(200, "application/json", json);
+  return responder(req, 200, "application/json", json);
 }
 
-void paginaNoEncontrada() {
-  responder(404, "text/plain; charset=utf-8", "No encontrado");
+// Cualquier otra direccion (por ejemplo, el icono /favicon.ico)
+esp_err_t paginaNoEncontrada(httpd_req_t* req, httpd_err_code_t error) {
+  responder(req, 404, "text/plain; charset=utf-8", "No encontrado");
+  return ESP_OK;   // ESP_OK mantiene abierta la conexion para la siguiente peticion
 }
 
-// Cierra la conexion en curso si lleva CONEXION_INACTIVA_MS abierta sin
-// enviar nada, para que el servidor pase a la siguiente (por ejemplo, Parar).
-// Se llama en loop() antes de server.handleClient().
-void cerrarConexionInactiva() {
-  static bool vigilando = false;
-  static unsigned long desde = 0;
+// Arranca el servidor web y registra las direcciones. Se arranca una vez y
+// sigue funcionando al cambiar entre modo AP y host: escucha en todas las
+// redes a la vez.
+void arrancarServidorWeb() {
+  httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+  config.server_port = 80;
+  config.max_open_sockets = WEB_MAX_CONEXIONES;
+  config.lru_purge_enable = true;   // si se llena, cierra la conexion menos usada
+  config.stack_size = 8192;         // margen para construir la pagina y los textos
 
-  NetworkClient& cliente = server.client();
-  if (cliente.connected() && cliente.available() == 0) {
-    if (!vigilando) {
-      vigilando = true;
-      desde = millis();
-    } else if (millis() - desde > CONEXION_INACTIVA_MS) {
-      depurar(String("[web] conexion de ") + cliente.remoteIP().toString() +
-              " cerrada: no envio nada en " + String(CONEXION_INACTIVA_MS) + " ms");
-      cliente.stop();
-      vigilando = false;
-    }
-  } else {
-    vigilando = false;
+  if (httpd_start(&servidor, &config) != ESP_OK) {
+    aviso("[web] ERROR: no se pudo arrancar el servidor web");
+    return;
   }
+  httpd_uri_t rutas[] = {
+    { .uri = "/",       .method = HTTP_GET, .handler = paginaPrincipal, .user_ctx = NULL },
+    { .uri = "/mover",  .method = HTTP_GET, .handler = ordenMover,      .user_ctx = NULL },
+    { .uri = "/parar",  .method = HTTP_GET, .handler = ordenParar,      .user_ctx = NULL },
+    { .uri = "/estado", .method = HTTP_GET, .handler = ordenEstado,     .user_ctx = NULL },
+    { .uri = "/rele",   .method = HTTP_GET, .handler = ordenRele,       .user_ctx = NULL },
+  };
+  for (auto& ruta : rutas) httpd_register_uri_handler(servidor, &ruta);
+  httpd_register_err_handler(servidor, HTTPD_404_NOT_FOUND, paginaNoEncontrada);
+  aviso("[web] servidor web en marcha (puerto 80)");
 }
 
 
@@ -770,8 +826,10 @@ void actualizarWifi() {
 // Antes para el motor y apaga el rele, porque se pierde la conexion con la web.
 void cambiarModoWifi() {
   aviso("[boton] BOOT pulsado: paro motor y rele y cambio de modo");
+  xSemaphoreTake(candadoEstado, portMAX_DELAY);
   pararMotor();
   if (releEncendido) apagarRele();
+  xSemaphoreGive(candadoEstado);
   if (modoWifi == MODO_AP) {
     empezarBusqueda();
   } else {
@@ -830,6 +888,9 @@ void setup() {
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, !LED_ENCENDIDO);
 
+  // Candado entre la web y loop() (ver candadoEstado)
+  candadoEstado = xSemaphoreCreateMutex();
+
   // Temporizador que da los pulsos (se arranca en moverMotor)
   esp_timer_create_args_t argsTemporizador = {};
   argsTemporizador.callback = &darPaso;
@@ -851,21 +912,18 @@ void setup() {
   Serial.print("Pulsos por vuelta: ");
   Serial.println(PULSOS_POR_VUELTA);
 
-  server.on("/", HTTP_GET, paginaPrincipal);
-  server.on("/mover", HTTP_GET, ordenMover);
-  server.on("/parar", HTTP_GET, ordenParar);
-  server.on("/estado", HTTP_GET, ordenEstado);
-  server.on("/rele", HTTP_GET, ordenRele);
-  server.onNotFound(paginaNoEncontrada);
-  server.begin();
+  // Servidor web (atiende en su propia tarea; loop() no tiene que llamarlo)
+  arrancarServidorWeb();
 }
 
 void loop() {
-  cerrarConexionInactiva();   // no deja que una conexion vacia bloquee la web
-  server.handleClient();      // atiende la web
+  xSemaphoreTake(candadoEstado, portMAX_DELAY);
   comprobarFinMovimiento();   // para el temporizador al acabar los pulsos
   comprobarRele();            // apaga el rele cuando acaba su tiempo
+  xSemaphoreGive(candadoEstado);
+
   leerBoot();                 // pulsacion de BOOT: cambia entre modo AP y host
   actualizarWifi();           // sigue la busqueda de red en modo host
   actualizarLed();            // parpadeo en AP, doble de rapido buscando, fijo conectado
+  delay(1);                   // cede el procesador a las demas tareas (web, WiFi)
 }

@@ -56,7 +56,7 @@ Todos están al principio de `control_motor_paso_a_paso.ino`:
 | `DIR_DERECHA` | HIGH | Nivel de DIR para girar a la derecha. Cámbialo a LOW si gira al revés |
 | `DIR_SETUP_US` | 5 | Espera entre cambiar DIR y el primer pulso |
 | `VUELTAS_MAX` | 1000 | Máximo de vueltas por orden |
-| `CONEXION_INACTIVA_MS` | 300 | Tiempo que el servidor espera en una conexión que no envía nada antes de cerrarla y atender la siguiente |
+| `WEB_MAX_CONEXIONES` | 7 | Conexiones a la web abiertas a la vez. Si se llenan, el servidor cierra la menos usada |
 | `DEPURACION` | true | Muestra en el Monitor Serie quién se conecta, el estado del router y cada petición a la web |
 | `DEPURAR_ESTADO` | false | Muestra también las consultas `/estado` que la página hace cada segundo |
 
@@ -75,7 +75,7 @@ Con `PULSO_US` a 1000 el motor da 500 pasos por segundo, que son 2,5 vueltas por
 4. Elige la placa "ESP32 Dev Module" y el puerto del ESP32.
 5. Pulsa Subir. Si sale "Wrong boot mode", mantén pulsado BOOT, pulsa y suelta EN, y sigue con BOOT pulsado hasta que salga "Writing at".
 
-No hace falta instalar ninguna librería: `WiFi.h`, `WebServer.h` y `ESPmDNS.h` vienen con el soporte de ESP32.
+No hace falta instalar ninguna librería: `WiFi.h`, `ESPmDNS.h` y el servidor web `esp_http_server.h` vienen con el soporte de ESP32.
 
 ## Manual de uso: modos WiFi
 
@@ -181,11 +181,18 @@ La página usa estas direcciones, que también se pueden llamar desde otro progr
 | `GET /rele?segundos=1` | Enciende el relé ese tiempo y luego se apaga solo |
 | `GET /estado` | Devuelve el estado en JSON: si se mueve, pulsos pendientes, sentido, pulsos por vuelta, si el motor tiene corriente, si el relé está encendido y cuánto le queda |
 
-## Por qué Parar llegaba tarde
+## El servidor web
 
-El servidor web del ESP32 atiende una conexión cada vez. Los navegadores abren conexiones por adelantado sin enviar nada, para ganar tiempo en el siguiente clic, y el servidor se quedaba hasta 5 segundos esperando en una de ellas sin atender las demás. Si Parar llegaba en ese momento, esperaba en cola y un movimiento corto terminaba antes.
+El programa usa `esp_http_server`, el servidor web del propio sistema del ESP32. Atiende varias conexiones a la vez en su propia tarea y, cuando se llenan, cierra la menos usada para dejar entrar a la nueva.
 
-Ahora `cerrarConexionInactiva()` cierra la conexión en curso si lleva `CONEXION_INACTIVA_MS` abierta sin enviar nada, y el servidor pasa a la siguiente. Además, el botón Parar de la página reintenta el envío hasta 5 veces si falla.
+Versiones anteriores usaban la librería `WebServer` de Arduino, que atiende una sola conexión cada vez. Los navegadores abren conexiones por adelantado sin enviar nada, y al recargar la página lanzan varias peticiones a la vez. Con un servidor de una sola conexión, Parar llegaba tarde y la página se colgaba al actualizar. Los parches para cerrar conexiones vacías no lo resolvían del todo, así que se cambió de servidor.
+
+**Cómo se reparte el trabajo:**
+- **La web** se atiende en la tarea del servidor. Cada orden toma un candado solo mientras cambia el estado del motor o del relé, y lo suelta antes de enviar la respuesta, para que un envío lento a un móvil con mala cobertura no frene nada.
+- **El bucle principal** se ocupa del fin de movimiento, el apagado del relé, el botón BOOT, la búsqueda de red y el LED.
+- **Los pulsos del motor** los da un temporizador, independiente de los dos anteriores.
+
+El botón Parar de la página reintenta el envío hasta 5 veces si falla.
 
 ## Cómo se generan los pulsos
 

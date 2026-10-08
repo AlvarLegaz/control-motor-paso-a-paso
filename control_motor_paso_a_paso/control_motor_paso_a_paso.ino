@@ -475,9 +475,21 @@ const char PAGINA[] PROGMEM = R"rawliteral(
   </div>
 
 <script>
+  // Peticion con tope de tiempo. Sin el, una peticion a un ESP32 que no
+  // responde (por ejemplo, justo despues de cambiar de modo) se queda colgada
+  // un minuto y bloquea las siguientes: el navegador solo admite unas pocas
+  // conexiones a la vez con el mismo servidor.
+  var TOPE_MS = 3000;
+  function pedir(url) {
+    var control = new AbortController();
+    var temporizador = setTimeout(() => control.abort(), TOPE_MS);
+    return fetch(url, { signal: control.signal, cache: 'no-store' })
+      .finally(() => clearTimeout(temporizador));
+  }
+
   // Envia una orden al ESP32 y muestra su respuesta
   function orden(url) {
-    fetch(url)
+    pedir(url)
       .then(r => r.text())
       .then(t => { document.getElementById('mensaje').textContent = t; })
       .catch(() => { document.getElementById('mensaje').textContent = 'Sin conexión con el ESP32'; });
@@ -493,7 +505,7 @@ const char PAGINA[] PROGMEM = R"rawliteral(
 
   // Orden de parar. Si no llega al ESP32, se reintenta hasta 'intentos' veces.
   function parar(intentos) {
-    fetch('/parar')
+    pedir('/parar')
       .then(r => r.text())
       .then(t => { document.getElementById('mensaje').textContent = t; })
       .catch(() => {
@@ -508,9 +520,13 @@ const char PAGINA[] PROGMEM = R"rawliteral(
     orden('/rele?segundos=' + encodeURIComponent(s));
   }
 
-  // Consulta el estado del motor cada segundo
+  // Consulta el estado del motor cada segundo. Si la anterior aun no ha
+  // contestado, no se lanza otra, para no acumular peticiones.
+  var consultando = false;
   function leerEstado() {
-    fetch('/estado')
+    if (consultando) return;
+    consultando = true;
+    pedir('/estado')
       .then(r => r.json())
       .then(e => {
         document.getElementById('estado').textContent = e.moviendo
@@ -520,7 +536,8 @@ const char PAGINA[] PROGMEM = R"rawliteral(
           ? 'encendido, quedan ' + (e.rele_ms_restantes / 1000).toFixed(1) + ' s'
           : 'apagado';
       })
-      .catch(() => { document.getElementById('estado').textContent = 'sin conexión'; });
+      .catch(() => { document.getElementById('estado').textContent = 'sin conexión'; })
+      .finally(() => { consultando = false; });
   }
   setInterval(leerEstado, 1000);
   leerEstado();
@@ -696,16 +713,51 @@ void actualizarLed() {
   }
 }
 
-// Publica el nombre motor.local en la red actual.
-void iniciarMdns() {
-  MDNS.end();
+// El nombre motor.local solo se publica en modo host. En modo AP la IP es
+// siempre 192.168.4.1 y no hace falta; y si se publicara el mismo nombre en
+// las dos redes, el movil se quedaria hasta 2 minutos con la IP antigua tras
+// cambiar de modo y tardaria eso en volver a cargar la pagina.
+bool mdnsActivo = false;
+
+void publicarNombre() {
   if (MDNS.begin(NOMBRE_RED)) {
     MDNS.addService("http", "tcp", 80);
+    mdnsActivo = true;
   }
+}
+
+// Retira el nombre avisando a la red ANTES de apagarla, para que el movil
+// olvide la IP antigua en el acto.
+void retirarNombre() {
+  if (!mdnsActivo) return;
+  MDNS.end();
+  mdnsActivo = false;
+  delay(50);   // tiempo para que salga el aviso de baja por la red
+}
+
+// El servidor web se para antes de cambiar de red y se arranca despues, para
+// no arrastrar conexiones de la red anterior.
+bool servidorArrancado = false;
+
+void arrancarServidor() {
+  server.begin();
+  servidorArrancado = true;
+}
+
+void pararServidor() {
+  if (servidorArrancado) server.stop();
+  servidorArrancado = false;
+}
+
+void reiniciarServidor() {
+  pararServidor();
+  arrancarServidor();
 }
 
 // Modo AP: crea la red propia ESP32_MOTOR.
 void entrarModoAP() {
+  retirarNombre();
+  pararServidor();
   WiFi.disconnect(true);
   WiFi.mode(WIFI_AP);
   if (!WiFi.softAP(WIFI_SSID, WIFI_PASSWORD, WIFI_CANAL)) {
@@ -713,7 +765,7 @@ void entrarModoAP() {
   }
   WiFi.setTxPower(WIFI_POTENCIA);
   modoWifi = MODO_AP;
-  iniciarMdns();
+  arrancarServidor();
 
   aviso(String("[wifi] modo AP: red ") + WIFI_SSID + " (clave " + WIFI_PASSWORD +
         "), web en http://" + WiFi.softAPIP().toString());
@@ -740,10 +792,13 @@ void probarSiguienteRed() {
 
 // Modo host: apaga la red propia y empieza a buscar las redes de la lista.
 void empezarBusqueda() {
+  pararServidor();
   WiFi.softAPdisconnect(true);
   WiFi.mode(WIFI_OFF);
   WiFi.setHostname(NOMBRE_RED);
   WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);   // sin ahorro de energia: la web responde sin esperas
+  arrancarServidor();
   modoWifi = MODO_BUSCANDO;
   redActual = -1;
   aviso("[wifi] modo host: buscando red");
@@ -757,7 +812,8 @@ void actualizarWifi() {
 
   if (WiFi.status() == WL_CONNECTED) {
     modoWifi = MODO_HOST;
-    iniciarMdns();
+    reiniciarServidor();
+    publicarNombre();
     aviso(String("[wifi] conectado a ") + REDES_SSID[redActual] + ", web en http://" +
           WiFi.localIP().toString() + " o http://" + NOMBRE_RED + ".local");
   } else if (millis() - inicioIntento >= TIEMPO_CONEXION_MS) {
@@ -845,19 +901,19 @@ void setup() {
   // Avisos de WiFi por el Monitor Serie (quien se conecta, router...)
   WiFi.onEvent(eventoWifi);
 
-  // Siempre se arranca en modo AP; BOOT pasa a modo host
-  entrarModoAP();
-
-  Serial.print("Pulsos por vuelta: ");
-  Serial.println(PULSOS_POR_VUELTA);
-
+  // Rutas de la web (el servidor lo arranca cada modo al activar su red)
   server.on("/", HTTP_GET, paginaPrincipal);
   server.on("/mover", HTTP_GET, ordenMover);
   server.on("/parar", HTTP_GET, ordenParar);
   server.on("/estado", HTTP_GET, ordenEstado);
   server.on("/rele", HTTP_GET, ordenRele);
   server.onNotFound(paginaNoEncontrada);
-  server.begin();
+
+  // Siempre se arranca en modo AP; BOOT pasa a modo host
+  entrarModoAP();
+
+  Serial.print("Pulsos por vuelta: ");
+  Serial.println(PULSOS_POR_VUELTA);
 }
 
 void loop() {

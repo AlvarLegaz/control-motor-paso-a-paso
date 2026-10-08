@@ -170,6 +170,14 @@
 // siguiente.
 #define CONEXION_INACTIVA_MS 300
 
+// Depuracion por el Monitor Serie (115200 baudios): dispositivos que se
+// conectan a la red propia, conexion con el router y cada peticion a la web,
+// con la hora en segundos desde el arranque. DEPURAR_ESTADO muestra tambien
+// las consultas /estado que la pagina hace cada segundo (por defecto no, para
+// que no tapen lo demas).
+#define DEPURACION          true
+#define DEPURAR_ESTADO      false
+
 // =====================================================================
 
 // Los GPIO 34 a 39 del ESP32 son solo de entrada: no pueden mover el driver.
@@ -201,6 +209,95 @@ unsigned long releDuracionMs = 0;     // cuanto tiempo tiene que estar encendido
 esp_timer_handle_t temporizadorPasos;
 portMUX_TYPE candadoMotor = portMUX_INITIALIZER_UNLOCKED;  // evita que el
                          // temporizador y la web toquen el estado a la vez
+
+
+// ---------------------------------------------------------------------
+//  DEPURACION
+// ---------------------------------------------------------------------
+
+// Escribe una linea en el Monitor Serie con la hora desde el arranque:
+// [   123.456] texto
+void aviso(const String& texto) {
+  unsigned long ms = millis();
+  char hora[16];
+  snprintf(hora, sizeof(hora), "[%6lu.%03lu] ", ms / 1000, ms % 1000);
+  Serial.print(hora);
+  Serial.println(texto);
+}
+
+// Como aviso(), pero solo si DEPURACION esta activada.
+void depurar(const String& texto) {
+  if (DEPURACION) aviso(texto);
+}
+
+// MAC en formato AA:BB:CC:DD:EE:FF
+String textoMac(const uint8_t* mac) {
+  char texto[18];
+  snprintf(texto, sizeof(texto), "%02X:%02X:%02X:%02X:%02X:%02X",
+           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  return String(texto);
+}
+
+// Avisos de la WiFi: quien se conecta a la red propia y como va la conexion
+// con el router. Lo llama el ESP32 en cada evento WiFi.
+void eventoWifi(arduino_event_id_t evento, arduino_event_info_t info) {
+  switch (evento) {
+    case ARDUINO_EVENT_WIFI_AP_STACONNECTED:
+      depurar(String("[wifi] AP: se conecta un dispositivo, MAC ") +
+              textoMac(info.wifi_ap_staconnected.mac) +
+              " (conectados: " + String(WiFi.softAPgetStationNum()) + ")");
+      break;
+    case ARDUINO_EVENT_WIFI_AP_STAIPASSIGNED:
+      depurar(String("[wifi] AP: IP asignada ") +
+              IPAddress(info.wifi_ap_staipassigned.ip.addr).toString());
+      break;
+    case ARDUINO_EVENT_WIFI_AP_STADISCONNECTED:
+      depurar(String("[wifi] AP: se desconecta MAC ") +
+              textoMac(info.wifi_ap_stadisconnected.mac) +
+              " (conectados: " + String(WiFi.softAPgetStationNum()) + ")");
+      break;
+    case ARDUINO_EVENT_WIFI_STA_CONNECTED:
+      depurar(String("[wifi] host: asociado a la red, canal ") +
+              String(info.wifi_sta_connected.channel));
+      break;
+    case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+      depurar(String("[wifi] host: IP ") + IPAddress(info.got_ip.ip_info.ip.addr).toString());
+      break;
+    case ARDUINO_EVENT_WIFI_STA_DISCONNECTED: {
+      uint8_t motivo = info.wifi_sta_disconnected.reason;
+      depurar(String("[wifi] host: desconectado, motivo ") + String(motivo) + " (" +
+              WiFi.disconnectReasonName((wifi_err_reason_t)motivo) + ")");
+      break;
+    }
+    default:
+      break;
+  }
+}
+
+// Envia la respuesta de la web y la anota: IP de quien pregunta, orden y
+// codigo de respuesta (con el texto, si es corto).
+void responder(int codigo, const char* tipo, const String& cuerpo) {
+  server.send(codigo, tipo, cuerpo);
+
+  bool esEstado = (server.uri() == "/estado");
+  if (!DEPURACION || (esEstado && !DEPURAR_ESTADO && codigo == 200)) return;
+
+  String linea = "[web] ";
+  linea += server.client().remoteIP().toString();
+  linea += (server.method() == HTTP_GET) ? " GET " : " otro ";
+  linea += server.uri();
+  for (int i = 0; i < server.args(); i++) {
+    linea += (i == 0) ? "?" : "&";
+    linea += server.argName(i) + "=" + server.arg(i);
+  }
+  linea += " -> ";
+  linea += codigo;
+  if (String(tipo).startsWith("text/plain")) {
+    linea += " ";
+    linea += cuerpo.length() > 70 ? cuerpo.substring(0, 70) + "..." : cuerpo;
+  }
+  depurar(linea);
+}
 
 
 // ---------------------------------------------------------------------
@@ -237,7 +334,7 @@ void activarDriver() {
 void desactivarDriver() {
   digitalWrite(ENABLE_PIN, !ENABLE_ACTIVO);
   driverActivo = false;
-  Serial.println("Motor en reposo: sin corriente");
+  aviso("[motor] en reposo: sin corriente");
 }
 
 // Prepara un movimiento de 'pulsos' pulsos en el sentido indicado
@@ -282,7 +379,7 @@ void comprobarFinMovimiento() {
     esp_timer_stop(temporizadorPasos);
     temporizadorEnMarcha = false;
     finMovimiento = millis();
-    Serial.println("Movimiento terminado");
+    aviso("[motor] movimiento terminado");
   }
   if (DESACTIVAR_EN_REPOSO && driverActivo && !temporizadorEnMarcha &&
       millis() - finMovimiento >= REPOSO_MS) {
@@ -313,7 +410,7 @@ void apagarRele() {
 void comprobarRele() {
   if (releEncendido && millis() - releInicio >= releDuracionMs) {
     apagarRele();
-    Serial.println("Rele apagado");
+    aviso("[rele] apagado");
   }
 }
 
@@ -442,13 +539,13 @@ void paginaPrincipal() {
   String html = PAGINA;
   html.replace("%PPV%", String(PULSOS_POR_VUELTA));
   html.replace("%RELE_S%", String(RELE_TIEMPO_S));
-  server.send(200, "text/html; charset=utf-8", html);
+  responder(200, "text/html; charset=utf-8", html);
 }
 
 // GET /mover?vueltas=1.5&sentido=der  (sentido: der o izq)
 void ordenMover() {
   if (pulsosPendientes > 0) {
-    server.send(409, "text/plain; charset=utf-8",
+    responder(409, "text/plain; charset=utf-8",
                 "El motor está girando. Espera a que termine o pulsa Parar.");
     return;
   }
@@ -462,18 +559,18 @@ void ordenMover() {
     String error = "Número de vueltas no válido (entre 0 y ";
     error += VUELTAS_MAX;
     error += ").";
-    server.send(400, "text/plain; charset=utf-8", error);
+    responder(400, "text/plain; charset=utf-8", error);
     return;
   }
   if (sentido != "der" && sentido != "izq") {
-    server.send(400, "text/plain; charset=utf-8", "Sentido no válido.");
+    responder(400, "text/plain; charset=utf-8", "Sentido no válido.");
     return;
   }
 
   // pulsos = vueltas * PULSOS_POR_VUELTA, redondeado al pulso mas cercano
   long pulsos = (long)(vueltas * PULSOS_POR_VUELTA + 0.5f);
   if (pulsos < 1) {
-    server.send(400, "text/plain; charset=utf-8", "Son menos de un pulso.");
+    responder(400, "text/plain; charset=utf-8", "Son menos de un pulso.");
     return;
   }
 
@@ -485,15 +582,13 @@ void ordenMover() {
   mensaje += derecha ? " vueltas a la derecha (" : " vueltas a la izquierda (";
   mensaje += pulsos;
   mensaje += " pulsos)";
-  Serial.println(mensaje);
-  server.send(200, "text/plain; charset=utf-8", mensaje);
+  responder(200, "text/plain; charset=utf-8", mensaje);
 }
 
 // GET /parar
 void ordenParar() {
   pararMotor();
-  Serial.println("Parado desde la web");
-  server.send(200, "text/plain; charset=utf-8", "Motor parado.");
+  responder(200, "text/plain; charset=utf-8", "Motor parado.");
 }
 
 // GET /rele?segundos=1.5  -> enciende el rele 1,5 s y luego se apaga solo
@@ -505,7 +600,7 @@ void ordenRele() {
     String error = "Tiempo del relé no válido (entre 0 y ";
     error += RELE_MAX_S;
     error += " segundos).";
-    server.send(400, "text/plain; charset=utf-8", error);
+    responder(400, "text/plain; charset=utf-8", error);
     return;
   }
   unsigned long ms = (unsigned long)(segundos * 1000 + 0.5f);
@@ -514,8 +609,7 @@ void ordenRele() {
   String mensaje = "Relé encendido ";
   mensaje += String(segundos, 1);
   mensaje += " s";
-  Serial.println(mensaje);
-  server.send(200, "text/plain; charset=utf-8", mensaje);
+  responder(200, "text/plain; charset=utf-8", mensaje);
 }
 
 // GET /estado  -> {"moviendo":true,"pulsos_pendientes":120,"sentido":"derecha",
@@ -537,11 +631,11 @@ void ordenEstado() {
   unsigned long transcurrido = millis() - releInicio;
   json += (releEncendido && transcurrido < releDuracionMs) ? releDuracionMs - transcurrido : 0;
   json += "}";
-  server.send(200, "application/json", json);
+  responder(200, "application/json", json);
 }
 
 void paginaNoEncontrada() {
-  server.send(404, "text/plain; charset=utf-8", "No encontrado");
+  responder(404, "text/plain; charset=utf-8", "No encontrado");
 }
 
 // Cierra la conexion en curso si lleva CONEXION_INACTIVA_MS abierta sin
@@ -557,6 +651,8 @@ void cerrarConexionInactiva() {
       vigilando = true;
       desde = millis();
     } else if (millis() - desde > CONEXION_INACTIVA_MS) {
+      depurar(String("[web] conexion de ") + cliente.remoteIP().toString() +
+              " cerrada: no envio nada en " + String(CONEXION_INACTIVA_MS) + " ms");
       cliente.stop();
       vigilando = false;
     }
@@ -613,19 +709,15 @@ void entrarModoAP() {
   WiFi.disconnect(true);
   WiFi.mode(WIFI_AP);
   if (!WiFi.softAP(WIFI_SSID, WIFI_PASSWORD, WIFI_CANAL)) {
-    Serial.println("ERROR: no se pudo crear la red WiFi (la clave debe tener al menos 8 caracteres)");
+    aviso("[wifi] ERROR: no se pudo crear la red (la clave debe tener al menos 8 caracteres)");
   }
   WiFi.setTxPower(WIFI_POTENCIA);
   modoWifi = MODO_AP;
   iniciarMdns();
 
-  Serial.print("Modo AP: red ");
-  Serial.print(WIFI_SSID);
-  Serial.print(" (clave ");
-  Serial.print(WIFI_PASSWORD);
-  Serial.print("), web en http://");
-  Serial.println(WiFi.softAPIP());
-  Serial.println("Pulsa BOOT para pasar a modo host");
+  aviso(String("[wifi] modo AP: red ") + WIFI_SSID + " (clave " + WIFI_PASSWORD +
+        "), web en http://" + WiFi.softAPIP().toString());
+  aviso("[wifi] pulsa BOOT para pasar a modo host");
 }
 
 // Empieza a probar la siguiente red de la lista. Si no quedan, vuelve a AP.
@@ -635,12 +727,12 @@ void probarSiguienteRed() {
   } while (redActual < NUM_REDES && REDES_SSID[redActual][0] == '\0');  // salta redes sin configurar
 
   if (redActual >= NUM_REDES) {
-    Serial.println("No se pudo conectar a ninguna red: vuelvo al modo AP");
+    aviso("[wifi] no se pudo conectar a ninguna red: vuelvo al modo AP");
     entrarModoAP();
     return;
   }
-  Serial.print("Conectando a ");
-  Serial.println(REDES_SSID[redActual]);
+  aviso(String("[wifi] probando ") + REDES_SSID[redActual] + " (hasta " +
+        String(TIEMPO_CONEXION_MS / 1000) + " s)");
   WiFi.disconnect();
   WiFi.begin(REDES_SSID[redActual], REDES_CLAVE[redActual]);
   inicioIntento = millis();
@@ -654,7 +746,7 @@ void empezarBusqueda() {
   WiFi.mode(WIFI_STA);
   modoWifi = MODO_BUSCANDO;
   redActual = -1;
-  Serial.println("Modo host: buscando red");
+  aviso("[wifi] modo host: buscando red");
   probarSiguienteRed();
 }
 
@@ -666,16 +758,10 @@ void actualizarWifi() {
   if (WiFi.status() == WL_CONNECTED) {
     modoWifi = MODO_HOST;
     iniciarMdns();
-    Serial.print("Conectado a ");
-    Serial.print(REDES_SSID[redActual]);
-    Serial.print(", web en http://");
-    Serial.print(WiFi.localIP());
-    Serial.print(" o http://");
-    Serial.print(NOMBRE_RED);
-    Serial.println(".local");
+    aviso(String("[wifi] conectado a ") + REDES_SSID[redActual] + ", web en http://" +
+          WiFi.localIP().toString() + " o http://" + NOMBRE_RED + ".local");
   } else if (millis() - inicioIntento >= TIEMPO_CONEXION_MS) {
-    Serial.print(REDES_SSID[redActual]);
-    Serial.println(" no disponible");
+    aviso(String("[wifi] ") + REDES_SSID[redActual] + " no disponible");
     probarSiguienteRed();
   }
 }
@@ -683,7 +769,7 @@ void actualizarWifi() {
 // Cambia de modo al pulsar BOOT: de AP a host, o de host (o buscando) a AP.
 // Antes para el motor y apaga el rele, porque se pierde la conexion con la web.
 void cambiarModoWifi() {
-  Serial.println("BOOT pulsado: paro motor y rele y cambio de modo");
+  aviso("[boton] BOOT pulsado: paro motor y rele y cambio de modo");
   pararMotor();
   if (releEncendido) apagarRele();
   if (modoWifi == MODO_AP) {
@@ -755,6 +841,9 @@ void setup() {
 
   // Boton BOOT (en la placa ya tiene resistencia a 3,3 V; se anade la interna)
   pinMode(BOTON_MODO_PIN, INPUT_PULLUP);
+
+  // Avisos de WiFi por el Monitor Serie (quien se conecta, router...)
+  WiFi.onEvent(eventoWifi);
 
   // Siempre se arranca en modo AP; BOOT pasa a modo host
   entrarModoAP();

@@ -57,6 +57,8 @@ Todos están al principio de `control_motor_paso_a_paso.ino`:
 | `DIR_SETUP_US` | 5 | Espera entre cambiar DIR y el primer pulso |
 | `VUELTAS_MAX` | 1000 | Máximo de vueltas por orden |
 | `CONEXION_INACTIVA_MS` | 300 | Tiempo que el servidor espera en una conexión que no envía nada antes de cerrarla y atender la siguiente |
+| `DEPURACION` | true | Muestra en el Monitor Serie quién se conecta, el estado del router y cada petición a la web |
+| `DEPURAR_ESTADO` | false | Muestra también las consultas `/estado` que la página hace cada segundo |
 
 Con `PULSO_US` a 1000 el motor da 500 pasos por segundo, que son 2,5 vueltas por segundo a 200 pulsos por vuelta. Si vibra sin girar o pierde pasos, sube `PULSO_US`.
 
@@ -120,6 +122,42 @@ stateDiagram-v2
 - **Si en modo host se cae la WiFi,** el LED vuelve a parpadear rápido mientras el ESP32 reconecta solo. Al recuperar la red se queda fijo de nuevo.
 - **Las redes y sus claves** están en `credenciales.h`, en el orden en que se prueban.
 - **El Monitor Serie,** a 115200 baudios, va contando cada paso: modo, redes probadas e IP.
+
+## Depuración por el Monitor Serie
+
+Abre el Monitor Serie del Arduino IDE a **115200 baudios**. Cada línea lleva delante los segundos desde el arranque, y una etiqueta según de qué trata:
+
+| Etiqueta | Qué avisa |
+|---|---|
+| `[wifi]` | Cambios de modo, redes probadas, dispositivos que se conectan o desconectan de ESP32_MOTOR con su MAC e IP, y conexión o caída del router con el motivo |
+| `[web]` | Cada petición a la página: IP de quien la hace, orden con sus parámetros, código de respuesta y texto. También las conexiones vacías que se cierran |
+| `[motor]` | Fin de movimiento y corte de corriente en reposo |
+| `[rele]` | Apagado del relé |
+| `[boton]` | Pulsación de BOOT |
+
+Ejemplo de una sesión en modo AP:
+
+```
+[     0.812] [wifi] modo AP: red ESP32_MOTOR (clave 12345678), web en http://192.168.4.1
+[     0.812] [wifi] pulsa BOOT para pasar a modo host
+[    14.203] [wifi] AP: se conecta un dispositivo, MAC 4A:E5:B5:64:03:42 (conectados: 1)
+[    14.951] [wifi] AP: IP asignada 192.168.4.2
+[    17.330] [web] 192.168.4.2 GET / -> 200
+[    21.004] [web] 192.168.4.2 GET /mover?vueltas=2&sentido=der -> 200 Girando 2.00 vueltas a la derecha (400 pulsos)
+[    22.118] [web] 192.168.4.2 GET /parar -> 200 Motor parado.
+[    22.618] [motor] en reposo: sin corriente
+```
+
+Las consultas `/estado` de cada segundo no salen, salvo que pongas `DEPURAR_ESTADO` a `true`. Para quitar toda la depuración, pon `DEPURACION` a `false`; los avisos de cambio de modo y de red siguen saliendo.
+
+**Motivos de desconexión del router más habituales,** que salen como `motivo N (NOMBRE)`:
+
+| Motivo | Qué suele significar |
+|---|---|
+| 201 `NO_AP_FOUND` | No encuentra la red: nombre mal escrito, red de 5 GHz o fuera de alcance |
+| 15 `4WAY_HANDSHAKE_TIMEOUT` o 204 `HANDSHAKE_TIMEOUT` | Casi siempre, clave incorrecta |
+| 202 `AUTH_FAIL` | El router rechaza la autenticación |
+| 8 `ASSOC_LEAVE` | Desconexión pedida por el propio ESP32, por ejemplo al cambiar de modo |
 
 ## Uso de la página
 

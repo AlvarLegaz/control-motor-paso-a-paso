@@ -1,6 +1,6 @@
 # Control motor paso a paso
 
-Programa para ESP32 con Arduino IDE que controla un motor paso a paso y un relé desde una página web. Al encender, el ESP32 crea su propia red WiFi, ESP32_MOTOR; con una pulsación del botón BOOT pasa a conectarse a la WiFi de casa. Funciona con cualquier driver de entradas STEP y DIR: A4988, DRV8825, TMC2208, TB6600, DM542 y similares.
+Programa para ESP32 con Arduino IDE que controla un motor paso a paso y dos relés desde una página web, y los combina en un disparo: un giro, una espera y los relés. Al encender, el ESP32 crea su propia red WiFi, ESP32_MOTOR; con una pulsación del botón BOOT pasa a conectarse a la WiFi de casa. Funciona con cualquier driver de entradas STEP y DIR: A4988, DRV8825, TMC2208, TB6600, DM542 y similares.
 
 El montaje probado usa un ESP32 WROOM-32, un driver Pololu DRV8825 y un motor 17HS19-2004S1. Sus hojas de datos y el detalle de todas las conexiones, el ajuste de corriente y el microstepping están en [docu/readme.txt](docu/readme.txt).
 
@@ -13,7 +13,8 @@ El montaje probado usa un ESP32 WROOM-32, un driver Pololu DRV8825 y un motor 17
 | GPIO 25 (D25) | EN | ENA+ |
 | GND | GND lógico | PUL-, DIR- y ENA- |
 
-Conexiones de los relés
+Conexiones de los relés:
+
 | Dispositivo | Pin ESP32 | Pin del módulo | Descripción |
 |---|---|---|---|
 | Relé 1 | GPIO 27 (D27) | IN1 | Control del primer relé |
@@ -21,7 +22,7 @@ Conexiones de los relés
 | Alimentación | VIN (5 V) o 3V3 | VCC | Según las especificaciones del módulo |
 | Masa | GND | GND | Masa común |
 
-El módulo de relé va a GPIO 27 (D27) en su entrada IN, con GND común y VCC a 5 V (VIN) o 3,3 V según el módulo. Los detalles están en [docu/readme.txt](docu/readme.txt).
+El relé 1 va a GPIO 27 (D27) y el relé 2 a GPIO 26 (D26), en las entradas IN1 e IN2 del módulo, con GND común y VCC a 5 V (VIN) o 3,3 V según el módulo. Los detalles están en [docu/readme.txt](docu/readme.txt).
 
 En la placa de desarrollo, D33 y D32 están justo al lado de D35 y D34. Los pines D34, D35, D36 (VP) y D39 (VN) no sirven para el driver: en el ESP32 son solo de entrada. El programa no compila si se ponen en `STEP_PIN` o `DIR_PIN`.
 
@@ -43,10 +44,12 @@ Todos están al principio de `control_motor_paso_a_paso.ino`:
 | `ENABLE_ACTIVO` | LOW | Nivel de EN que activa el driver. LOW en DRV8825 y A4988 |
 | `DESACTIVAR_EN_REPOSO` | true | Corta la corriente del motor cuando lleva `REPOSO_MS` parado. Pon `false` si una carga puede mover el eje en reposo |
 | `REPOSO_MS` | 500 | Tiempo parado antes de cortar la corriente |
-| `RELE_PIN` | 27 | GPIO conectado a la entrada IN del módulo de relé. Evita GPIO 14 y 15, que dan pulsos durante el arranque |
-| `RELE_ACTIVO` | HIGH | Nivel que enciende el relé. Muchos módulos con optoacoplador usan LOW |
-| `RELE_TIEMPO_S` | 1 | Tiempo por defecto del relé en la web, en segundos |
-| `RELE_MAX_S` | 600 | Tiempo máximo del relé por orden |
+| `RELE1_PIN` | 27 | GPIO conectado a la entrada IN1 del módulo: el relé 1. Evita GPIO 14 y 15, que dan pulsos durante el arranque |
+| `RELE2_PIN` | 26 | GPIO conectado a la entrada IN2 del módulo: el relé 2 |
+| `RELE_ACTIVO` | HIGH | Nivel que enciende los relés. Muchos módulos con optoacoplador usan LOW |
+| `RELE_TIEMPO_S` | 1 | Tiempo por defecto de cada relé en la web, en segundos |
+| `RELE_MAX_S` | 600 | Tiempo máximo de cada relé por orden |
+| `DISPARO_ESPERA_MS` | 1000 | Espera del disparo entre el final del giro y el encendido de los relés |
 | `ENABLE_ESPERA_MS` | 5 | Espera tras dar corriente antes del primer paso |
 | `PULSOS_POR_VUELTA` | 200 | Pulsos para una vuelta. Con microstepping se multiplica: 1/8 son 1600, 1/16 son 3200 |
 | `PULSO_US` | 1000 | Microsegundos de STEP en alto y luego en bajo. Un paso dura el doble |
@@ -126,7 +129,7 @@ stateDiagram-v2
 5. Si no encuentra ninguna red en unos 30 segundos, vuelve solo al modo AP y el LED parpadea de nuevo.
 
 **Importante:**
-- **Cada cambio de modo para el motor y apaga el relé,** porque en ese momento se pierde la conexión con la página y no podrías pararlos.
+- **Cada cambio de modo para el motor, cancela el disparo, apaga los dos relés y cancela la activación en serie,** porque en ese momento se pierde la conexión con la página y no podrías pararlos.
 - **Si en modo host se cae la WiFi,** el LED vuelve a parpadear rápido mientras el ESP32 reconecta solo. Al recuperar la red se queda fijo de nuevo.
 - **Las redes y sus claves** están en `credenciales.h`, en el orden en que se prueban.
 - **El Monitor Serie,** a 115200 baudios, va contando cada paso: modo, redes probadas e IP.
@@ -140,7 +143,8 @@ Abre el Monitor Serie del Arduino IDE a **115200 baudios**. Cada línea lleva de
 | `[wifi]` | Cambios de modo, redes probadas, dispositivos que se conectan o desconectan de ESP32_MOTOR con su MAC e IP, y conexión o caída del router con el motivo |
 | `[web]` | Cada petición a la página: IP de quien la hace, orden con sus parámetros, código de respuesta y texto. También las conexiones vacías que se cierran |
 | `[motor]` | Fin de movimiento y corte de corriente en reposo |
-| `[rele]` | Apagado del relé |
+| `[rele]` | Apagado de cada relé y, en una activación en serie, el encendido del segundo |
+| `[disparo]` | Fin del giro del disparo, encendido de los relés y disparos cancelados |
 | `[boton]` | Pulsación de BOOT |
 
 Ejemplo de una sesión en modo AP:
@@ -175,7 +179,35 @@ El número de pulsos se calcula como vueltas por `PULSOS_POR_VUELTA`, redondeado
 
 Mientras el motor gira, las órdenes de mover se rechazan con un aviso. Hay que esperar a que termine o pulsar Parar.
 
-El bloque del relé tiene un campo de tiempo, 1 segundo por defecto, y el botón **Activar relé**: el relé se enciende ese tiempo y se apaga solo. La línea de estado indica si el motor gira o está parado, con o sin corriente, y si el relé está encendido y cuánto le queda.
+El bloque de los relés tiene un campo de tiempo para cada relé, 1 segundo por defecto, y estos botones:
+
+| Botón | Qué hace |
+|---|---|
+| **Activar relé 1** | Enciende el relé 1 durante su tiempo y se apaga solo |
+| **Activar relé 2** | Enciende el relé 2 durante su tiempo y se apaga solo |
+| **Relé 1 y luego relé 2** | Activación en serie: enciende el relé 1 durante su tiempo y, al apagarse, el relé 2 durante el suyo |
+| **Relé 2 y luego relé 1** | Activación en serie al revés: primero el relé 2 y luego el relé 1, cada uno con su tiempo |
+
+En una activación en serie, el segundo relé espera apagado su turno. Una orden suelta a cualquier relé cancela la serie pendiente, igual que un cambio de modo con BOOT. Si se lanza otra serie mientras dura una, la nueva sustituye a la anterior.
+
+### Disparo
+
+El bloque naranja junta el motor y los relés. El botón **Realizar disparo** hace tres cosas seguidas:
+
+1. Gira las vueltas de la casilla **Número de vueltas**, de arriba, en el sentido elegido. Valen fracciones de vuelta, por ejemplo 0,1.
+2. Cuando el giro termina, espera 1 segundo (`DISPARO_ESPERA_MS`).
+3. Enciende los relés según la opción marcada debajo, cada uno con el tiempo de su casilla.
+
+| Opción | Qué hace al disparar |
+|---|---|
+| **Relé 1** | Enciende el relé 1 |
+| **Relé 2** | Enciende el relé 2 |
+| **Relé 1 y luego 2** | Enciende el relé 1 y, al apagarse, el relé 2 |
+| **Relé 2 y luego 1** | Enciende el relé 2 y, al apagarse, el relé 1 |
+
+Debajo se elige el sentido del giro, a la derecha por defecto. **Parar**, una orden de girar o un cambio de modo con BOOT cancelan el disparo mientras gira o espera; si los relés ya se han encendido, siguen hasta acabar su tiempo. Mientras el motor gira, un disparo nuevo se rechaza, igual que las órdenes de mover.
+
+La línea de estado indica si el motor gira o está parado, con o sin corriente, en qué fase está el disparo, si cada relé está encendido y cuánto le queda y, durante una serie, qué relé se enciende después y durante cuánto tiempo.
 
 ## Órdenes HTTP
 
@@ -186,8 +218,10 @@ La página usa estas direcciones, que también se pueden llamar desde otro progr
 | `GET /` | Página de control |
 | `GET /mover?vueltas=1.5&sentido=der` | Gira 1,5 vueltas a la derecha. `sentido` es `der` o `izq` |
 | `GET /parar` | Para el motor |
-| `GET /rele?segundos=1` | Enciende el relé ese tiempo y luego se apaga solo |
-| `GET /estado` | Devuelve el estado en JSON: si se mueve, pulsos pendientes, sentido, pulsos por vuelta, si el motor tiene corriente, si el relé está encendido y cuánto le queda |
+| `GET /rele?n=1&segundos=1` | Enciende el relé 1 ese tiempo y luego se apaga solo. Con `n=2`, el relé 2. Sin `n`, el relé 1 |
+| `GET /serie?orden=12&segundos1=1&segundos2=3` | Activación en serie: el relé 1 durante `segundos1` y, al apagarse, el relé 2 durante `segundos2`. Con `orden=21`, primero el relé 2. `segundos1` es siempre el tiempo del relé 1 |
+| `GET /disparo?vueltas=0.1&sentido=der&modo=12&segundos1=1&segundos2=3` | Disparo: gira 0,1 vueltas a la derecha, espera `DISPARO_ESPERA_MS` y enciende los relés según `modo`: `1`, `2`, `12` (relé 1 y luego relé 2) o `21` (relé 2 y luego relé 1). `segundos1` y `segundos2` son los tiempos del relé 1 y del relé 2 |
+| `GET /estado` | Devuelve el estado en JSON: si se mueve, pulsos pendientes, sentido, pulsos por vuelta, si el motor tiene corriente, si cada relé está encendido y cuánto le queda (`rele`, `rele_ms_restantes`, `rele2`, `rele2_ms_restantes`) y, en una serie, qué relé va después y su tiempo (`serie_siguiente`, `serie_ms`; 0 si no hay serie), y la fase del disparo (`disparo`: `girando`, `esperando` o vacío) con su modo (`disparo_modo`) |
 
 ## El servidor web
 
@@ -196,8 +230,8 @@ El programa usa `esp_http_server`, el servidor web del propio sistema del ESP32.
 Versiones anteriores usaban la librería `WebServer` de Arduino, que atiende una sola conexión cada vez. Los navegadores abren conexiones por adelantado sin enviar nada, y al recargar la página lanzan varias peticiones a la vez. Con un servidor de una sola conexión, Parar llegaba tarde y la página se colgaba al actualizar. Los parches para cerrar conexiones vacías no lo resolvían del todo, así que se cambió de servidor.
 
 **Cómo se reparte el trabajo:**
-- **La web** se atiende en la tarea del servidor. Cada orden toma un candado solo mientras cambia el estado del motor o del relé, y lo suelta antes de enviar la respuesta, para que un envío lento a un móvil con mala cobertura no frene nada.
-- **El bucle principal** se ocupa del fin de movimiento, el apagado del relé, el botón BOOT, la búsqueda de red y el LED.
+- **La web** se atiende en la tarea del servidor. Cada orden toma un candado solo mientras cambia el estado del motor o de los relés, y lo suelta antes de enviar la respuesta, para que un envío lento a un móvil con mala cobertura no frene nada.
+- **El bucle principal** se ocupa del fin de movimiento, la espera y el encendido del disparo, el apagado de los relés y el paso al segundo en una serie, el botón BOOT, la búsqueda de red y el LED.
 - **Los pulsos del motor** los da un temporizador, independiente de los dos anteriores.
 
 El botón Parar de la página reintenta el envío hasta 5 veces si falla.

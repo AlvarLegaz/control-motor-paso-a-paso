@@ -3,18 +3,22 @@
   ===============================================
 
   El ESP32 sirve una pagina web sencilla para mover un motor paso a paso con
-  un driver de entradas STEP y DIR (A4988, DRV8825, TMC2208, TB6600, DM542...).
+  un driver de entradas STEP y DIR (A4988, DRV8825, TMC2208, TB6600, DM542...)
+  y encender dos reles temporizados: cada uno por su lado o los dos en serie
+  (primero uno durante su tiempo y, al apagarse, el otro durante el suyo).
+  El DISPARO junta las dos cosas: gira las vueltas indicadas, espera
+  DISPARO_ESPERA_MS y enciende el rele 1, el 2, o los dos en serie.
 
   MODOS WIFI
     - Al arrancar crea su propia red ESP32_MOTOR (modo AP), web en
       http://192.168.4.1. LED parpadeando.
     - Una pulsacion corta del boton BOOT (pasados ARRANQUE_GRACIA_MS desde el
-      arranque) para el motor y el rele y pasa a modo host: busca la WiFi de
+      arranque) para el motor y los reles y pasa a modo host: busca la WiFi de
       casa y despues la segunda red, TIEMPO_CONEXION_MS cada una. LED
       parpadeando el doble de rapido.
     - Si conecta: LED fijo, web en http://motor.local o en la IP que sale por
       el Monitor Serie. Si no conecta a ninguna, vuelve al modo AP.
-    - Otra pulsacion de BOOT para el motor y el rele y vuelve al modo AP.
+    - Otra pulsacion de BOOT para el motor y los reles y vuelve al modo AP.
 
   USO
     1. Poner nombre y clave de las WiFi en credenciales.h (hay un ejemplo en
@@ -32,10 +36,11 @@
     GPIO 25  (ENABLE_PIN) EN   corta la corriente del motor en reposo
                                (en drivers optoacoplados tipo TB6600: ENA+)
 
-    ESP32               Modulo de rele
-    -----               --------------
-    GPIO 27  (RELE_PIN) IN
-    GND                 GND
+    ESP32                Modulo de 2 reles
+    -----                -----------------
+    GPIO 27  (RELE1_PIN) IN1   rele 1
+    GPIO 26  (RELE2_PIN) IN2   rele 2
+    GND                  GND
     VIN (5 V del USB)   VCC   (si el modulo es de 5 V)
     GND                 GND logico del driver (en TB6600: PUL- y DIR-)
 
@@ -97,16 +102,22 @@
 #define REPOSO_MS           500     // tiempo parado antes de cortar la corriente
 #define ENABLE_ESPERA_MS    5       // espera tras activar el driver antes del primer paso
 
-// Rele temporizado: el boton de la web lo enciende durante el tiempo
-// indicado y luego se apaga solo.
-#define RELE_PIN            27      // GPIO conectado a la entrada IN del modulo de rele (D27)
+// Dos reles temporizados: cada boton de la web enciende su rele durante el
+// tiempo indicado y luego se apaga solo. La activacion en serie enciende uno
+// y, cuando se apaga, el otro, cada uno con su tiempo.
+#define RELE1_PIN           27      // GPIO conectado a la entrada IN1 del modulo de reles (D27)
+#define RELE2_PIN           26      // GPIO conectado a la entrada IN2 del modulo de reles (D26)
                                     // No usar GPIO 14 ni 15: dan pulsos durante el arranque
                                     // del ESP32 y el rele chasquearia al encender
-#define RELE_ACTIVO         HIGH    // nivel que enciende el rele. Muchos modulos con
+#define RELE_ACTIVO         HIGH    // nivel que enciende los reles. Muchos modulos con
                                     // optoacoplador se activan con LOW: si el rele se
                                     // enciende al arrancar y se apaga al pulsar, pon LOW
-#define RELE_TIEMPO_S       1       // tiempo por defecto en la web, en segundos
+#define RELE_TIEMPO_S       1       // tiempo por defecto en la web, en segundos (los dos reles)
 #define RELE_MAX_S          600     // tiempo maximo por orden, en segundos
+
+// Disparo: el motor gira las vueltas del campo, se para, espera este tiempo
+// y enciende los reles segun el modo elegido en la web.
+#define DISPARO_ESPERA_MS   1000
 
 // Pulsos que necesita el driver para una vuelta completa del motor.
 // Motor de 200 pasos sin microstepping = 200.
@@ -180,8 +191,11 @@
 // =====================================================================
 
 // Los GPIO 34 a 39 del ESP32 son solo de entrada: no pueden mover el driver.
-#if (STEP_PIN >= 34 && STEP_PIN <= 39) || (DIR_PIN >= 34 && DIR_PIN <= 39) || (ENABLE_PIN >= 34 && ENABLE_PIN <= 39) || (RELE_PIN >= 34 && RELE_PIN <= 39)
-#error "STEP_PIN, DIR_PIN, ENABLE_PIN y RELE_PIN no pueden ser los GPIO 34 a 39: en el ESP32 son solo de entrada. Usa por ejemplo 33, 32, 25 y 27."
+#if (STEP_PIN >= 34 && STEP_PIN <= 39) || (DIR_PIN >= 34 && DIR_PIN <= 39) || (ENABLE_PIN >= 34 && ENABLE_PIN <= 39) || (RELE1_PIN >= 34 && RELE1_PIN <= 39) || (RELE2_PIN >= 34 && RELE2_PIN <= 39)
+#error "STEP_PIN, DIR_PIN, ENABLE_PIN, RELE1_PIN y RELE2_PIN no pueden ser los GPIO 34 a 39: en el ESP32 son solo de entrada. Usa por ejemplo 33, 32, 25, 27 y 26."
+#endif
+#if RELE1_PIN == RELE2_PIN
+#error "RELE1_PIN y RELE2_PIN tienen que ser GPIO distintos."
 #endif
 
 // El temporizador del ESP32 no admite periodos menores de 50 us.
@@ -192,8 +206,8 @@
 httpd_handle_t servidor = NULL;
 
 // La web se atiende en la tarea del servidor y el resto (fin de movimiento,
-// rele, boton, WiFi) en loop(). Este candado evita que las dos toquen el
-// estado del motor y del rele a la vez.
+// reles, boton, WiFi) en loop(). Este candado evita que las dos toquen el
+// estado del motor y de los reles a la vez.
 SemaphoreHandle_t candadoEstado;
 
 // Estado del movimiento. moverMotor() lo prepara y el temporizador da los
@@ -205,10 +219,32 @@ bool temporizadorEnMarcha = false;
 bool driverActivo = false;            // true = bobinas con corriente
 unsigned long finMovimiento = 0;      // instante (millis) en que paro el motor
 
-// Estado del rele
-bool releEncendido = false;
-unsigned long releInicio = 0;         // instante (millis) en que se encendio
-unsigned long releDuracionMs = 0;     // cuanto tiempo tiene que estar encendido
+// Estado de cada rele (reles[0] es el rele 1 y reles[1] el rele 2)
+struct Rele {
+  int pin;
+  bool encendido;
+  unsigned long inicio;               // instante (millis) en que se encendio
+  unsigned long duracionMs;           // cuanto tiempo tiene que estar encendido
+};
+Rele reles[] = {
+  { RELE1_PIN, false, 0, 0 },
+  { RELE2_PIN, false, 0, 0 },
+};
+const int NUM_RELES = sizeof(reles) / sizeof(reles[0]);
+
+// Activacion en serie: cuando se apague el rele 'serieTras', se enciende el
+// rele 'serieSiguiente' durante 'serieMs'. -1 = no hay ninguna pendiente.
+int serieTras = -1;
+int serieSiguiente = -1;
+unsigned long serieMs = 0;
+
+// Disparo: giro, espera de DISPARO_ESPERA_MS y reles. disparoModo: "1", "2",
+// "12" (rele 1 y luego rele 2) o "21" (rele 2 y luego rele 1).
+enum FaseDisparo { DISPARO_NO, DISPARO_GIRANDO, DISPARO_ESPERANDO };
+FaseDisparo faseDisparo = DISPARO_NO;
+String disparoModo = "";
+unsigned long disparoMs1 = 0, disparoMs2 = 0;   // tiempo del rele 1 y del rele 2
+unsigned long disparoEsperaInicio = 0;          // instante (millis) en que paro el giro
 
 esp_timer_handle_t temporizadorPasos;
 portMUX_TYPE candadoMotor = portMUX_INITIALIZER_UNLOCKED;  // evita que el
@@ -423,28 +459,92 @@ void comprobarFinMovimiento() {
 
 
 // ---------------------------------------------------------------------
-//  RELE
+//  RELES
 // ---------------------------------------------------------------------
 
-// Enciende el rele durante 'ms' milisegundos. Si ya estaba encendido,
-// vuelve a empezar a contar con el tiempo nuevo.
-void encenderRele(unsigned long ms) {
-  digitalWrite(RELE_PIN, RELE_ACTIVO);
-  releEncendido = true;
-  releInicio = millis();
-  releDuracionMs = ms;
+// Enciende el rele i (0 = rele 1, 1 = rele 2) durante 'ms' milisegundos. Si
+// ya estaba encendido, vuelve a empezar a contar con el tiempo nuevo.
+void encenderRele(int i, unsigned long ms) {
+  digitalWrite(reles[i].pin, RELE_ACTIVO);
+  reles[i].encendido = true;
+  reles[i].inicio = millis();
+  reles[i].duracionMs = ms;
 }
 
-void apagarRele() {
-  digitalWrite(RELE_PIN, !RELE_ACTIVO);
-  releEncendido = false;
+void apagarRele(int i) {
+  digitalWrite(reles[i].pin, !RELE_ACTIVO);
+  reles[i].encendido = false;
 }
 
-// Se llama en loop(): apaga el rele cuando ha pasado su tiempo. No bloquea.
-void comprobarRele() {
-  if (releEncendido && millis() - releInicio >= releDuracionMs) {
-    apagarRele();
-    aviso("[rele] apagado");
+// Milisegundos que le quedan encendido al rele i (0 si esta apagado).
+unsigned long releRestante(int i) {
+  if (!reles[i].encendido) return 0;
+  unsigned long transcurrido = millis() - reles[i].inicio;
+  return transcurrido < reles[i].duracionMs ? reles[i].duracionMs - transcurrido : 0;
+}
+
+// Cancela la activacion en serie pendiente (el segundo rele ya no se enciende).
+void cancelarSerie() {
+  serieTras = -1;
+  serieSiguiente = -1;
+}
+
+// Activacion en serie: enciende el rele 'primero' durante 'msPrimero' y,
+// cuando se apaga, el rele 'segundo' durante 'msSegundo'.
+void encenderSerie(int primero, unsigned long msPrimero, int segundo, unsigned long msSegundo) {
+  apagarRele(segundo);              // el segundo espera apagado su turno
+  encenderRele(primero, msPrimero);
+  serieTras = primero;
+  serieSiguiente = segundo;
+  serieMs = msSegundo;
+}
+
+// Enciende los reles segun el modo: "1", "2", "12" (serie 1 y luego 2) o
+// "21" (serie 2 y luego 1). ms1 y ms2 son los tiempos del rele 1 y del rele 2.
+void encenderModo(const String& modo, unsigned long ms1, unsigned long ms2) {
+  cancelarSerie();
+  if (modo == "1") encenderRele(0, ms1);
+  else if (modo == "2") encenderRele(1, ms2);
+  else if (modo == "12") encenderSerie(0, ms1, 1, ms2);
+  else if (modo == "21") encenderSerie(1, ms2, 0, ms1);
+}
+
+// Cancela el disparo pendiente (si los reles aun no se han encendido).
+void cancelarDisparo() {
+  if (faseDisparo != DISPARO_NO) aviso("[disparo] cancelado");
+  faseDisparo = DISPARO_NO;
+}
+
+// Se llama en loop(), despues de comprobarFinMovimiento(): cuando el giro del
+// disparo termina, espera DISPARO_ESPERA_MS y enciende los reles. No bloquea.
+void comprobarDisparo() {
+  if (faseDisparo == DISPARO_GIRANDO && !temporizadorEnMarcha && pulsosPendientes == 0) {
+    faseDisparo = DISPARO_ESPERANDO;
+    disparoEsperaInicio = millis();
+    aviso("[disparo] giro terminado: espero " + String(DISPARO_ESPERA_MS) + " ms");
+  }
+  if (faseDisparo == DISPARO_ESPERANDO && millis() - disparoEsperaInicio >= DISPARO_ESPERA_MS) {
+    faseDisparo = DISPARO_NO;
+    encenderModo(disparoModo, disparoMs1, disparoMs2);
+    aviso("[disparo] disparo: reles en modo " + disparoModo);
+  }
+}
+
+// Se llama en loop(): apaga cada rele cuando ha pasado su tiempo y, si era el
+// primero de una serie, enciende el siguiente. No bloquea.
+void comprobarReles() {
+  for (int i = 0; i < NUM_RELES; i++) {
+    if (reles[i].encendido && millis() - reles[i].inicio >= reles[i].duracionMs) {
+      apagarRele(i);
+      aviso(String("[rele] rele ") + (i + 1) + " apagado");
+      if (serieTras == i) {
+        int siguiente = serieSiguiente;
+        cancelarSerie();
+        encenderRele(siguiente, serieMs);
+        aviso(String("[rele] serie: enciendo el rele ") + (siguiente + 1) + " " +
+              String(serieMs / 1000.0, 1) + " s");
+      }
+    }
   }
 }
 
@@ -453,7 +553,7 @@ void comprobarRele() {
 //  PAGINA WEB
 // ---------------------------------------------------------------------
 
-// %PPV% se sustituye por PULSOS_POR_VUELTA al enviar la pagina.
+// %PPV%, %RELE_S% y %ESPERA_S% se sustituyen al enviar la pagina (paginaPrincipal).
 const char PAGINA[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html lang="es">
@@ -474,6 +574,19 @@ const char PAGINA[] PROGMEM = R"rawliteral(
   button:active { background: #0d47a1; }
   button.parar { background: #c62828; }
   button.rele { background: #2e7d32; }
+  button.serie { background: #00695c; }
+  button.disparo { background: #e65100; font-weight: bold; }
+  .opciones { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+  .opciones label { flex: 1 1 40%; margin: 0; }
+  .opciones input { position: absolute; opacity: 0; width: 0; }
+  .opciones span { display: block; text-align: center; padding: 10px 4px; border-radius: 6px;
+                   border: 2px solid #bbb; background: #fafafa; cursor: pointer; }
+  .opciones input:checked + span { border-color: #e65100; background: #fff3e0; font-weight: bold; }
+  .opciones input:focus-visible + span { outline: 2px solid #1565c0; }
+  .titulo-opciones { margin-top: 14px; font-size: 0.95em; color: #555; }
+  .rele-fila { display: flex; gap: 10px; align-items: flex-end; }
+  .rele-fila > div { flex: 1; }
+  .rele-fila button { margin-top: 0; }
   #estado { font-weight: bold; }
 </style>
 </head>
@@ -497,14 +610,48 @@ const char PAGINA[] PROGMEM = R"rawliteral(
   </div>
 
   <div class="caja">
-    <label for="segundos">Tiempo del relé (segundos)</label>
-    <input id="segundos" type="number" min="0" step="any" value="%RELE_S%" inputmode="decimal">
-    <button class="rele" onclick="activarRele()">Activar relé</button>
+    <div class="rele-fila">
+      <div>
+        <label for="segundos1">Relé 1 (segundos)</label>
+        <input id="segundos1" type="number" min="0" step="any" value="%RELE_S%" inputmode="decimal">
+      </div>
+      <button class="rele" onclick="activarRele('1')">Activar relé 1</button>
+    </div>
+    <div class="rele-fila" style="margin-top: 12px">
+      <div>
+        <label for="segundos2">Relé 2 (segundos)</label>
+        <input id="segundos2" type="number" min="0" step="any" value="%RELE_S%" inputmode="decimal">
+      </div>
+      <button class="rele" onclick="activarRele('2')">Activar relé 2</button>
+    </div>
+    <div class="fila">
+      <button class="serie" onclick="activarSerie('12')">Relé 1 y luego relé 2</button>
+      <button class="serie" onclick="activarSerie('21')">Relé 2 y luego relé 1</button>
+    </div>
+  </div>
+
+  <div class="caja">
+    <button class="disparo" style="margin-top: 0" onclick="disparar()">Realizar disparo</button>
+    <div class="titulo-opciones">Gira las vueltas de arriba, espera %ESPERA_S% s y dispara con:</div>
+    <div class="opciones">
+      <label><input type="radio" name="modo" value="1" checked><span>Relé 1</span></label>
+      <label><input type="radio" name="modo" value="2"><span>Relé 2</span></label>
+      <label><input type="radio" name="modo" value="12"><span>Relé 1 y luego 2</span></label>
+      <label><input type="radio" name="modo" value="21"><span>Relé 2 y luego 1</span></label>
+    </div>
+    <div class="titulo-opciones">Sentido del giro:</div>
+    <div class="opciones">
+      <label><input type="radio" name="sentidoDisparo" value="izq"><span>Izquierda</span></label>
+      <label><input type="radio" name="sentidoDisparo" value="der" checked><span>Derecha</span></label>
+    </div>
   </div>
 
   <div class="caja">
     Motor: <span id="estado">-</span><br>
-    Relé: <span id="rele">-</span><br>
+    Disparo: <span id="disparo">-</span><br>
+    Relé 1: <span id="rele1">-</span><br>
+    Relé 2: <span id="rele2">-</span><br>
+    <span id="serie"></span>
     <span id="mensaje"></span>
   </div>
 
@@ -536,10 +683,33 @@ const char PAGINA[] PROGMEM = R"rawliteral(
       });
   }
 
-  // Enciende el rele durante los segundos del campo
-  function activarRele() {
-    var s = document.getElementById('segundos').value.replace(',', '.');
-    orden('/rele?segundos=' + encodeURIComponent(s));
+  // Enciende el rele 1 o el 2 con los segundos de su campo
+  function segundosRele(n) {
+    return encodeURIComponent(document.getElementById('segundos' + n).value.replace(',', '.'));
+  }
+  function activarRele(n) {
+    orden('/rele?n=' + n + '&segundos=' + segundosRele(n));
+  }
+
+  // Disparo: gira las vueltas del campo en el sentido elegido, espera 1 s y
+  // enciende los reles en el modo elegido, cada uno con los segundos de su campo
+  function disparar() {
+    var vueltas = document.getElementById('vueltas').value.replace(',', '.');
+    var modo = document.querySelector('input[name=modo]:checked').value;
+    var sentido = document.querySelector('input[name=sentidoDisparo]:checked').value;
+    orden('/disparo?vueltas=' + encodeURIComponent(vueltas) + '&sentido=' + sentido + '&modo=' + modo +
+          '&segundos1=' + segundosRele(1) + '&segundos2=' + segundosRele(2));
+  }
+
+  // Activacion en serie: '12' = rele 1 y, al apagarse, rele 2; '21' = al reves.
+  // Cada rele con los segundos de su campo.
+  function activarSerie(ordenSerie) {
+    orden('/serie?orden=' + ordenSerie + '&segundos1=' + segundosRele(1) + '&segundos2=' + segundosRele(2));
+  }
+
+  // Texto del estado de un rele
+  function textoRele(encendido, ms) {
+    return encendido ? 'encendido, quedan ' + (ms / 1000).toFixed(1) + ' s' : 'apagado';
   }
 
   // Consulta el estado del motor cada segundo
@@ -550,9 +720,16 @@ const char PAGINA[] PROGMEM = R"rawliteral(
         document.getElementById('estado').textContent = e.moviendo
           ? 'girando a la ' + e.sentido + ', quedan ' + e.pulsos_pendientes + ' pulsos'
           : (e.con_corriente ? 'parado, con corriente' : 'parado, sin corriente');
-        document.getElementById('rele').textContent = e.rele
-          ? 'encendido, quedan ' + (e.rele_ms_restantes / 1000).toFixed(1) + ' s'
-          : 'apagado';
+        var modos = { '1': 'relé 1', '2': 'relé 2', '12': 'relé 1 y luego 2', '21': 'relé 2 y luego 1' };
+        document.getElementById('disparo').textContent =
+          e.disparo === 'girando' ? 'girando, después dispara con ' + modos[e.disparo_modo]
+          : e.disparo === 'esperando' ? 'esperando para disparar con ' + modos[e.disparo_modo]
+          : 'listo';
+        document.getElementById('rele1').textContent = textoRele(e.rele, e.rele_ms_restantes);
+        document.getElementById('rele2').textContent = textoRele(e.rele2, e.rele2_ms_restantes);
+        document.getElementById('serie').innerHTML = e.serie_siguiente
+          ? 'En serie: después se enciende el relé ' + e.serie_siguiente + ' (' + (e.serie_ms / 1000).toFixed(1) + ' s)<br>'
+          : '';
       })
       .catch(() => { document.getElementById('estado').textContent = 'sin conexión'; });
   }
@@ -569,7 +746,7 @@ const char PAGINA[] PROGMEM = R"rawliteral(
 // ---------------------------------------------------------------------
 
 // Cada manejador corre en la tarea del servidor web. Toma candadoEstado solo
-// mientras lee o cambia el estado del motor y del rele, y lo suelta ANTES de
+// mientras lee o cambia el estado del motor y de los reles, y lo suelta ANTES de
 // enviar la respuesta: asi un envio lento a un movil con mala cobertura nunca
 // frena el bucle principal ni el motor.
 
@@ -578,38 +755,48 @@ esp_err_t paginaPrincipal(httpd_req_t* req) {
   String html = PAGINA;
   html.replace("%PPV%", String(PULSOS_POR_VUELTA));
   html.replace("%RELE_S%", String(RELE_TIEMPO_S));
+  html.replace("%ESPERA_S%", String(DISPARO_ESPERA_MS / 1000.0, DISPARO_ESPERA_MS % 1000 ? 1 : 0));
   return responder(req, 200, "text/html; charset=utf-8", html);
 }
 
-// GET /mover?vueltas=1.5&sentido=der  (sentido: der o izq)
-esp_err_t ordenMover(httpd_req_t* req) {
+// Lee vueltas y sentido de la peticion y los pasa a pulsos. Devuelve "" si
+// son validos o el texto del error.
+String leerGiro(httpd_req_t* req, float& vueltas, long& pulsos, bool& derecha) {
   String textoVueltas = argumento(req, "vueltas");
   textoVueltas.replace(",", ".");          // admite 0,5 ademas de 0.5
   textoVueltas.replace("%2C", ".");        // la coma puede llegar codificada
-  float vueltas = textoVueltas.toFloat();
+  vueltas = textoVueltas.toFloat();
   String sentido = argumento(req, "sentido");
 
   if (vueltas <= 0 || vueltas > VUELTAS_MAX) {
     String error = "Número de vueltas no válido (entre 0 y ";
     error += VUELTAS_MAX;
     error += ").";
-    return responder(req, 400, "text/plain; charset=utf-8", error);
+    return error;
   }
-  if (sentido != "der" && sentido != "izq") {
-    return responder(req, 400, "text/plain; charset=utf-8", "Sentido no válido.");
-  }
+  if (sentido != "der" && sentido != "izq") return "Sentido no válido.";
 
   // pulsos = vueltas * PULSOS_POR_VUELTA, redondeado al pulso mas cercano
-  long pulsos = (long)(vueltas * PULSOS_POR_VUELTA + 0.5f);
-  if (pulsos < 1) {
-    return responder(req, 400, "text/plain; charset=utf-8", "Son menos de un pulso.");
-  }
+  pulsos = (long)(vueltas * PULSOS_POR_VUELTA + 0.5f);
+  if (pulsos < 1) return "Son menos de un pulso.";
+  derecha = (sentido == "der");
+  return "";
+}
 
-  bool derecha = (sentido == "der");
+// GET /mover?vueltas=1.5&sentido=der  (sentido: der o izq). Cancela el
+// disparo que estuviera esperando.
+esp_err_t ordenMover(httpd_req_t* req) {
+  float vueltas; long pulsos; bool derecha;
+  String error = leerGiro(req, vueltas, pulsos, derecha);
+  if (error != "") return responder(req, 400, "text/plain; charset=utf-8", error);
+
   bool ocupado;
   xSemaphoreTake(candadoEstado, portMAX_DELAY);
   ocupado = (pulsosPendientes > 0);
-  if (!ocupado) moverMotor(pulsos, derecha);
+  if (!ocupado) {
+    cancelarDisparo();
+    moverMotor(pulsos, derecha);
+  }
   xSemaphoreGive(candadoEstado);
 
   if (ocupado) {
@@ -624,47 +811,151 @@ esp_err_t ordenMover(httpd_req_t* req) {
   return responder(req, 200, "text/plain; charset=utf-8", mensaje);
 }
 
-// GET /parar
+// GET /parar  (para el motor y cancela el disparo si aun no ha encendido los reles)
 esp_err_t ordenParar(httpd_req_t* req) {
   xSemaphoreTake(candadoEstado, portMAX_DELAY);
+  cancelarDisparo();
   pararMotor();
   xSemaphoreGive(candadoEstado);
   return responder(req, 200, "text/plain; charset=utf-8", "Motor parado.");
 }
 
-// GET /rele?segundos=1.5  -> enciende el rele 1,5 s y luego se apaga solo
-esp_err_t ordenRele(httpd_req_t* req) {
-  String texto = argumento(req, "segundos");
+// Segundos de un parametro (admite coma). Devuelve -1 si no es valido.
+float segundosDe(httpd_req_t* req, const char* nombre) {
+  String texto = argumento(req, nombre);
   texto.replace(",", ".");
   texto.replace("%2C", ".");
   float segundos = texto.toFloat();
-  if (segundos <= 0 || segundos > RELE_MAX_S) {
-    String error = "Tiempo del relé no válido (entre 0 y ";
-    error += RELE_MAX_S;
-    error += " segundos).";
-    return responder(req, 400, "text/plain; charset=utf-8", error);
+  return (segundos > 0 && segundos <= RELE_MAX_S) ? segundos : -1;
+}
+
+// Texto de error de un tiempo de rele fuera de rango.
+String errorTiempoRele() {
+  String error = "Tiempo del relé no válido (entre 0 y ";
+  error += RELE_MAX_S;
+  error += " segundos).";
+  return error;
+}
+
+// GET /rele?n=1&segundos=1.5  -> enciende el rele 1 durante 1,5 s y luego se apaga solo
+// GET /rele?n=2&segundos=3    -> lo mismo con el rele 2
+// Sin 'n' es el rele 1, como en las versiones de un solo rele. Cancela la
+// activacion en serie que hubiera pendiente.
+esp_err_t ordenRele(httpd_req_t* req) {
+  String n = argumento(req, "n");
+  if (n == "") n = "1";
+  if (n != "1" && n != "2") {
+    return responder(req, 400, "text/plain; charset=utf-8", "Relé no válido: n tiene que ser 1 o 2.");
   }
-  unsigned long ms = (unsigned long)(segundos * 1000 + 0.5f);
+  float segundos = segundosDe(req, "segundos");
+  if (segundos < 0) return responder(req, 400, "text/plain; charset=utf-8", errorTiempoRele());
+
   xSemaphoreTake(candadoEstado, portMAX_DELAY);
-  encenderRele(ms);
+  cancelarSerie();
+  encenderRele(n == "1" ? 0 : 1, (unsigned long)(segundos * 1000 + 0.5f));
   xSemaphoreGive(candadoEstado);
 
-  String mensaje = "Relé encendido ";
+  String mensaje = "Relé ";
+  mensaje += n;
+  mensaje += " encendido ";
   mensaje += String(segundos, 1);
   mensaje += " s";
   return responder(req, 200, "text/plain; charset=utf-8", mensaje);
 }
 
+// GET /serie?orden=12&segundos1=1.5&segundos2=3
+//   -> activacion en serie: el rele 1 durante segundos1 y, al apagarse, el
+//      rele 2 durante segundos2. Con orden=21, primero el 2 y luego el 1
+//      (cada uno con su tiempo: segundos1 es siempre el del rele 1).
+esp_err_t ordenSerie(httpd_req_t* req) {
+  String tipo = argumento(req, "orden");
+  if (tipo != "12" && tipo != "21") {
+    return responder(req, 400, "text/plain; charset=utf-8", "Orden no válido: tiene que ser 12 o 21.");
+  }
+  float s1 = segundosDe(req, "segundos1");
+  float s2 = segundosDe(req, "segundos2");
+  if (s1 < 0 || s2 < 0) return responder(req, 400, "text/plain; charset=utf-8", errorTiempoRele());
+  unsigned long ms1 = (unsigned long)(s1 * 1000 + 0.5f), ms2 = (unsigned long)(s2 * 1000 + 0.5f);
+
+  xSemaphoreTake(candadoEstado, portMAX_DELAY);
+  if (tipo == "12") encenderSerie(0, ms1, 1, ms2);
+  else encenderSerie(1, ms2, 0, ms1);
+  xSemaphoreGive(candadoEstado);
+
+  String mensaje = "En serie: relé ";
+  if (tipo == "12") {
+    mensaje += "1 " + String(s1, 1) + " s y luego relé 2 " + String(s2, 1) + " s";
+  } else {
+    mensaje += "2 " + String(s2, 1) + " s y luego relé 1 " + String(s1, 1) + " s";
+  }
+  return responder(req, 200, "text/plain; charset=utf-8", mensaje);
+}
+
+// GET /disparo?vueltas=0.1&sentido=der&modo=12&segundos1=1&segundos2=3
+//   -> gira 0,1 vueltas a la derecha, espera DISPARO_ESPERA_MS y enciende los
+//      reles segun 'modo': 1, 2, 12 (rele 1 y luego rele 2) o 21 (al reves),
+//      el rele 1 durante segundos1 y el rele 2 durante segundos2.
+esp_err_t ordenDisparo(httpd_req_t* req) {
+  float vueltas; long pulsos; bool derecha;
+  String error = leerGiro(req, vueltas, pulsos, derecha);
+  if (error != "") return responder(req, 400, "text/plain; charset=utf-8", error);
+  String modo = argumento(req, "modo");
+  if (modo != "1" && modo != "2" && modo != "12" && modo != "21") {
+    return responder(req, 400, "text/plain; charset=utf-8", "Modo de disparo no válido: 1, 2, 12 o 21.");
+  }
+  // solo hacen falta los tiempos de los reles que se usan
+  float s1 = (modo == "2") ? 1 : segundosDe(req, "segundos1");
+  float s2 = (modo == "1") ? 1 : segundosDe(req, "segundos2");
+  if (s1 < 0 || s2 < 0) return responder(req, 400, "text/plain; charset=utf-8", errorTiempoRele());
+
+  bool ocupado;
+  xSemaphoreTake(candadoEstado, portMAX_DELAY);
+  ocupado = (pulsosPendientes > 0);
+  if (!ocupado) {
+    disparoModo = modo;
+    disparoMs1 = (unsigned long)(s1 * 1000 + 0.5f);
+    disparoMs2 = (unsigned long)(s2 * 1000 + 0.5f);
+    faseDisparo = DISPARO_GIRANDO;
+    moverMotor(pulsos, derecha);
+  }
+  xSemaphoreGive(candadoEstado);
+
+  if (ocupado) {
+    return responder(req, 409, "text/plain; charset=utf-8",
+                     "El motor está girando. Espera a que termine o pulsa Parar.");
+  }
+  String mensaje = "Disparo: ";
+  mensaje += String(vueltas, 2);
+  mensaje += derecha ? " vueltas a la derecha, espera de " : " vueltas a la izquierda, espera de ";
+  mensaje += String(DISPARO_ESPERA_MS / 1000.0, 1);
+  mensaje += " s y ";
+  if (modo == "1") mensaje += "relé 1";
+  else if (modo == "2") mensaje += "relé 2";
+  else if (modo == "12") mensaje += "relé 1 y luego relé 2";
+  else mensaje += "relé 2 y luego relé 1";
+  return responder(req, 200, "text/plain; charset=utf-8", mensaje);
+}
+
 // GET /estado  -> {"moviendo":true,"pulsos_pendientes":120,"sentido":"derecha",
-//                  "pulsos_por_vuelta":200,"con_corriente":true,"rele":false,"rele_ms_restantes":0}
+//                  "pulsos_por_vuelta":200,"con_corriente":true,
+//                  "rele":false,"rele_ms_restantes":0,"rele2":true,"rele2_ms_restantes":2500,
+//                  "serie_siguiente":1,"serie_ms":1500,"disparo":"girando","disparo_modo":"12"}
+// ("rele" y "rele_ms_restantes" son los del rele 1, con los nombres de siempre;
+//  serie_siguiente es el rele que se enciende despues en una serie, 0 si no hay;
+//  disparo es "girando", "esperando" o "" si no hay ninguno pendiente)
 esp_err_t ordenEstado(httpd_req_t* req) {
   xSemaphoreTake(candadoEstado, portMAX_DELAY);
   long pendientes = pulsosPendientes;
   bool derecha = sentidoDerecha;
   bool conCorriente = driverActivo;
-  bool rele = releEncendido;
-  unsigned long transcurrido = millis() - releInicio;
-  unsigned long restante = (rele && transcurrido < releDuracionMs) ? releDuracionMs - transcurrido : 0;
+  bool rele = reles[0].encendido;
+  unsigned long restante = releRestante(0);
+  bool rele2 = reles[1].encendido;
+  unsigned long restante2 = releRestante(1);
+  int serieSig = serieSiguiente + 1;     // 0 = no hay serie pendiente
+  unsigned long msSerie = serieSiguiente >= 0 ? serieMs : 0;
+  const char* fase = faseDisparo == DISPARO_GIRANDO ? "girando" : faseDisparo == DISPARO_ESPERANDO ? "esperando" : "";
+  String modo = faseDisparo != DISPARO_NO ? disparoModo : "";
   xSemaphoreGive(candadoEstado);
 
   String json = "{\"moviendo\":";
@@ -681,7 +972,19 @@ esp_err_t ordenEstado(httpd_req_t* req) {
   json += rele ? "true" : "false";
   json += ",\"rele_ms_restantes\":";
   json += restante;
-  json += "}";
+  json += ",\"rele2\":";
+  json += rele2 ? "true" : "false";
+  json += ",\"rele2_ms_restantes\":";
+  json += restante2;
+  json += ",\"serie_siguiente\":";
+  json += serieSig;
+  json += ",\"serie_ms\":";
+  json += msSerie;
+  json += ",\"disparo\":\"";
+  json += fase;
+  json += "\",\"disparo_modo\":\"";
+  json += modo;
+  json += "\"}";
   return responder(req, 200, "application/json", json);
 }
 
@@ -711,6 +1014,8 @@ void arrancarServidorWeb() {
     { .uri = "/parar",  .method = HTTP_GET, .handler = ordenParar,      .user_ctx = NULL },
     { .uri = "/estado", .method = HTTP_GET, .handler = ordenEstado,     .user_ctx = NULL },
     { .uri = "/rele",   .method = HTTP_GET, .handler = ordenRele,       .user_ctx = NULL },
+    { .uri = "/serie",  .method = HTTP_GET, .handler = ordenSerie,      .user_ctx = NULL },
+    { .uri = "/disparo", .method = HTTP_GET, .handler = ordenDisparo,   .user_ctx = NULL },
   };
   for (auto& ruta : rutas) httpd_register_uri_handler(servidor, &ruta);
   httpd_register_err_handler(servidor, HTTPD_404_NOT_FOUND, paginaNoEncontrada);
@@ -823,12 +1128,16 @@ void actualizarWifi() {
 }
 
 // Cambia de modo al pulsar BOOT: de AP a host, o de host (o buscando) a AP.
-// Antes para el motor y apaga el rele, porque se pierde la conexion con la web.
+// Antes para el motor y apaga los reles, porque se pierde la conexion con la web.
 void cambiarModoWifi() {
-  aviso("[boton] BOOT pulsado: paro motor y rele y cambio de modo");
+  aviso("[boton] BOOT pulsado: paro motor, disparo y reles y cambio de modo");
   xSemaphoreTake(candadoEstado, portMAX_DELAY);
+  cancelarDisparo();
   pararMotor();
-  if (releEncendido) apagarRele();
+  cancelarSerie();
+  for (int i = 0; i < NUM_RELES; i++) {
+    if (reles[i].encendido) apagarRele(i);
+  }
   xSemaphoreGive(candadoEstado);
   if (modoWifi == MODO_AP) {
     empezarBusqueda();
@@ -880,10 +1189,12 @@ void setup() {
     driverActivo = true;
   }
 
-  // Rele apagado desde el primer momento (se fija el nivel antes de hacerlo salida)
-  digitalWrite(RELE_PIN, !RELE_ACTIVO);
-  pinMode(RELE_PIN, OUTPUT);
-  digitalWrite(RELE_PIN, !RELE_ACTIVO);
+  // Reles apagados desde el primer momento (se fija el nivel antes de hacerlos salida)
+  for (int i = 0; i < NUM_RELES; i++) {
+    digitalWrite(reles[i].pin, !RELE_ACTIVO);
+    pinMode(reles[i].pin, OUTPUT);
+    digitalWrite(reles[i].pin, !RELE_ACTIVO);
+  }
 
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, !LED_ENCENDIDO);
@@ -919,7 +1230,8 @@ void setup() {
 void loop() {
   xSemaphoreTake(candadoEstado, portMAX_DELAY);
   comprobarFinMovimiento();   // para el temporizador al acabar los pulsos
-  comprobarRele();            // apaga el rele cuando acaba su tiempo
+  comprobarDisparo();         // tras el giro del disparo, espera y enciende los reles
+  comprobarReles();           // apaga cada rele cuando acaba su tiempo (y sigue las series)
   xSemaphoreGive(candadoEstado);
 
   leerBoot();                 // pulsacion de BOOT: cambia entre modo AP y host

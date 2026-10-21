@@ -36,24 +36,32 @@ Material
   El DRV8825 acepta senales de 3,3 V y no necesita alimentacion logica.
 
 
-1b. ESP32 -> modulo de rele
----------------------------
+1b. ESP32 -> modulo de dos reles
+--------------------------------
 
-  ESP32              Rele           Notas
-  -----              ----           -----
-  D27 (GPIO 27)      IN             RELE_PIN en el programa
+  ESP32              Modulo         Notas
+  -----              ------         -----
+  D27 (GPIO 27)      IN1            Rele 1, RELE1_PIN en el programa
+  D26 (GPIO 26)      IN2            Rele 2, RELE2_PIN en el programa
   GND                GND
   VIN (5 V del USB)  VCC            Para modulos de 5 V. Si es de 3,3 V, a 3V3
 
-  El boton "Activar rele" de la web lo enciende durante el tiempo del campo
-  (1 s por defecto, RELE_TIEMPO_S) y se apaga solo. Maximo RELE_MAX_S (600 s).
+  Los botones "Activar rele 1" y "Activar rele 2" de la web encienden cada
+  rele durante el tiempo de su campo (1 s por defecto, RELE_TIEMPO_S) y se
+  apaga solo. Maximo RELE_MAX_S (600 s).
+  La activacion en serie ("Rele 1 y luego rele 2" o "Rele 2 y luego rele 1")
+  enciende un rele durante su tiempo y, cuando se apaga, el otro durante el
+  suyo.
+  El boton "Realizar disparo" gira el motor las vueltas del campo, espera
+  1 s (DISPARO_ESPERA_MS) y enciende los reles segun la opcion elegida: rele
+  1, rele 2, 1 y luego 2, o 2 y luego 1.
 
-  No pongas el rele en D14 ni en D15: esos pines dan pulsos durante el
+  No pongas los reles en D14 ni en D15: esos pines dan pulsos durante el
   arranque del ESP32 y el rele chasquearia al encender o reiniciar la placa.
 
-  Muchos modulos con optoacoplador se encienden con IN a nivel BAJO. Si el
-  rele se enciende al arrancar el ESP32 y se apaga al pulsar el boton, cambia
-  RELE_ACTIVO a LOW en el programa.
+  Muchos modulos con optoacoplador se encienden con IN a nivel BAJO. Si los
+  reles se encienden al arrancar el ESP32 y se apagan al pulsar el boton,
+  cambia RELE_ACTIVO a LOW en el programa (vale para los dos).
   Con modulos de 5 V activos a nivel bajo, los 3,3 V del ESP32 a veces no
   bastan para apagarlos del todo. Si se queda encendido, alimenta el modulo a
   3,3 V si lo admite o usa un modulo activo a nivel alto.
@@ -167,7 +175,8 @@ Material
     12345678, web en http://192.168.4.1
   - BOOT no hace nada durante los 3 primeros segundos ni mientras siga
     pulsado desde el arranque.
-  - Cada cambio de modo PARA EL MOTOR Y APAGA EL RELE.
+  - Cada cambio de modo PARA EL MOTOR, CANCELA EL DISPARO Y APAGA LOS DOS
+    RELES (y cancela la activacion en serie).
   - En modo host, si se cae la WiFi, el LED vuelve a parpadear rapido mientras
     reconecta solo.
 

@@ -13,6 +13,14 @@ El montaje probado usa un ESP32 WROOM-32, un driver Pololu DRV8825 y un motor 17
 | GPIO 25 (D25) | EN | ENA+ |
 | GND | GND lógico | PUL-, DIR- y ENA- |
 
+Conexiones de los relés
+| Dispositivo | Pin ESP32 | Pin del módulo | Descripción |
+|---|---|---|---|
+| Relé 1 | GPIO 27 (D27) | IN1 | Control del primer relé |
+| Relé 2 | GPIO 26 (D26) | IN2 | Control del segundo relé |
+| Alimentación | VIN (5 V) o 3V3 | VCC | Según las especificaciones del módulo |
+| Masa | GND | GND | Masa común |
+
 El módulo de relé va a GPIO 27 (D27) en su entrada IN, con GND común y VCC a 5 V (VIN) o 3,3 V según el módulo. Los detalles están en [docu/readme.txt](docu/readme.txt).
 
 En la placa de desarrollo, D33 y D32 están justo al lado de D35 y D34. Los pines D34, D35, D36 (VP) y D39 (VN) no sirven para el driver: en el ESP32 son solo de entrada. El programa no compila si se ponen en `STEP_PIN` o `DIR_PIN`.

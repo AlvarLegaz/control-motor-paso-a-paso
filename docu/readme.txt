@@ -42,7 +42,7 @@ Material
   ESP32              Modulo         Notas
   -----              ------         -----
   D27 (GPIO 27)      IN1            Rele 1, RELE1_PIN en el programa
-  D26 (GPIO 26)      IN2            Rele 2, RELE2_PIN en el programa
+  D13 (GPIO 13)      IN2            Rele 2, RELE2_PIN en el programa
   GND                GND
   VIN (5 V del USB)  VCC            Para modulos de 5 V. Si es de 3,3 V, a 3V3
 
@@ -52,9 +52,9 @@ Material
   La activacion en serie ("Rele 1 y luego rele 2" o "Rele 2 y luego rele 1")
   enciende un rele durante su tiempo y, cuando se apaga, el otro durante el
   suyo.
-  El boton "Realizar disparo" gira el motor las vueltas del campo, espera
-  1 s (DISPARO_ESPERA_MS) y enciende los reles segun la opcion elegida: rele
-  1, rele 2, 1 y luego 2, o 2 y luego 1.
+  El boton "Realizar disparo" avanza el angulo de avance, retrocede el de
+  retroceso, espera 1 s (DISPARO_ESPERA_MS) y enciende los reles segun la
+  opcion elegida: rele 1, rele 2, 1 y luego 2, o 2 y luego 1.
 
   No pongas los reles en D14 ni en D15: esos pines dan pulsos durante el
   arranque del ESP32 y el rele chasquearia al encender o reiniciar la placa.

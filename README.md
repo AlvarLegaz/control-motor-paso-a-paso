@@ -18,11 +18,11 @@ Conexiones de los relés:
 | Dispositivo | Pin ESP32 | Pin del módulo | Descripción |
 |---|---|---|---|
 | Relé 1 | GPIO 27 (D27) | IN1 | Control del primer relé |
-| Relé 2 | GPIO 26 (D26) | IN2 | Control del segundo relé |
+| Relé 2 | GPIO 13 (D13) | IN2 | Control del segundo relé |
 | Alimentación | VIN (5 V) o 3V3 | VCC | Según las especificaciones del módulo |
 | Masa | GND | GND | Masa común |
 
-El relé 1 va a GPIO 27 (D27) y el relé 2 a GPIO 26 (D26), en las entradas IN1 e IN2 del módulo, con GND común y VCC a 5 V (VIN) o 3,3 V según el módulo. Los detalles están en [docu/readme.txt](docu/readme.txt).
+El relé 1 va a GPIO 27 (D27) y el relé 2 a GPIO 13 (D13), en las entradas IN1 e IN2 del módulo, con GND común y VCC a 5 V (VIN) o 3,3 V según el módulo. Los detalles están en [docu/readme.txt](docu/readme.txt).
 
 En la placa de desarrollo, D33 y D32 están justo al lado de D35 y D34. Los pines D34, D35, D36 (VP) y D39 (VN) no sirven para el driver: en el ESP32 son solo de entrada. El programa no compila si se ponen en `STEP_PIN` o `DIR_PIN`.
 
@@ -45,7 +45,7 @@ Todos están al principio de `control_motor_paso_a_paso.ino`:
 | `DESACTIVAR_EN_REPOSO` | true | Corta la corriente del motor cuando lleva `REPOSO_MS` parado. Pon `false` si una carga puede mover el eje en reposo |
 | `REPOSO_MS` | 500 | Tiempo parado antes de cortar la corriente |
 | `RELE1_PIN` | 27 | GPIO conectado a la entrada IN1 del módulo: el relé 1. Evita GPIO 14 y 15, que dan pulsos durante el arranque |
-| `RELE2_PIN` | 26 | GPIO conectado a la entrada IN2 del módulo: el relé 2 |
+| `RELE2_PIN` | 13 | GPIO conectado a la entrada IN2 del módulo: el relé 2 |
 | `RELE_ACTIVO` | HIGH | Nivel que enciende los relés. Muchos módulos con optoacoplador usan LOW |
 | `RELE_TIEMPO_S` | 1 | Tiempo por defecto de cada relé en la web, en segundos |
 | `RELE_MAX_S` | 600 | Tiempo máximo de cada relé por orden |

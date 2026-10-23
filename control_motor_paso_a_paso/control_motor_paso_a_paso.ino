@@ -45,7 +45,7 @@
     ESP32                Modulo de 2 reles
     -----                -----------------
     GPIO 27  (RELE1_PIN) IN1   rele 1
-    GPIO 26  (RELE2_PIN) IN2   rele 2
+    GPIO 13  (RELE2_PIN) IN2   rele 2
     GND                  GND
     VIN (5 V del USB)   VCC   (si el modulo es de 5 V)
     GND                 GND logico del driver (en TB6600: PUL- y DIR-)
@@ -211,7 +211,7 @@
 
 // Los GPIO 34 a 39 del ESP32 son solo de entrada: no pueden mover el driver.
 #if (STEP_PIN >= 34 && STEP_PIN <= 39) || (DIR_PIN >= 34 && DIR_PIN <= 39) || (ENABLE_PIN >= 34 && ENABLE_PIN <= 39) || (RELE1_PIN >= 34 && RELE1_PIN <= 39) || (RELE2_PIN >= 34 && RELE2_PIN <= 39)
-#error "STEP_PIN, DIR_PIN, ENABLE_PIN, RELE1_PIN y RELE2_PIN no pueden ser los GPIO 34 a 39: en el ESP32 son solo de entrada. Usa por ejemplo 33, 32, 25, 27 y 26."
+#error "STEP_PIN, DIR_PIN, ENABLE_PIN, RELE1_PIN y RELE2_PIN no pueden ser los GPIO 34 a 39: en el ESP32 son solo de entrada. Usa por ejemplo 33, 32, 25, 27 y 13."
 #endif
 #if RELE1_PIN == RELE2_PIN
 #error "RELE1_PIN y RELE2_PIN tienen que ser GPIO distintos."

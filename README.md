@@ -52,7 +52,8 @@ Todos están al principio de `control_motor_paso_a_paso.ino`:
 | `DISPARO_ESPERA_MS` | 1000 | Espera del disparo entre el final del giro y el encendido de los relés |
 | `ENABLE_ESPERA_MS` | 5 | Espera tras dar corriente antes del primer paso |
 | `PULSOS_POR_VUELTA` | 200 | Pulsos para una vuelta. Con microstepping se multiplica: 1/8 son 1600, 1/16 son 3200 |
-| `PULSO_US` | 1000 | Microsegundos de STEP en alto y luego en bajo. Un paso dura el doble |
+| `PULSO_US` | 1000 | Microsegundos de STEP en alto y luego en bajo. Un paso dura el doble. Es la velocidad al encender: 150 rpm a 200 pulsos por vuelta |
+| `RPM_MIN` / `RPM_MAX` | 10 / 300 | Límites del deslizador de velocidad, en vueltas por minuto. Sin rampa de aceleración, si pierde pasos a mucha velocidad, baja `RPM_MAX` |
 | `LED_PIN` | 2 | LED de estado de la WiFi, el azul de la placa |
 | `LED_AP_MS` | 500 | Medio periodo del parpadeo en modo AP. Buscando red parpadea el doble de rápido |
 | `BOTON_MODO_PIN` | 0 | Botón que cambia de modo: el BOOT de la placa |
@@ -173,9 +174,15 @@ Las consultas `/estado` de cada segundo no salen, salvo que pongas `DEPURAR_ESTA
 
 ## Uso de la página
 
-La página muestra los pulsos por vuelta, un campo para el número de vueltas, los botones de girar a cada lado, los de una vuelta a cada lado y un botón Parar. También muestra si el motor está girando y cuántos pulsos le quedan.
+La página muestra los pulsos por vuelta y tres deslizadores:
 
-El número de pulsos se calcula como vueltas por `PULSOS_POR_VUELTA`, redondeado al pulso más cercano. Con 200 pulsos por vuelta, 0,5 vueltas son 100 pulsos y 2 vueltas son 400. Admite decimales con punto o con coma.
+| Deslizador | Qué hace |
+|---|---|
+| **Velocidad** | De `RPM_MIN` a `RPM_MAX` vueltas por minuto. Se envía al soltarlo y cambia también el giro en curso. Se mantiene al recargar la página, no al apagar el ESP32 |
+| **Ángulo de avance** | De 0 a 360 grados. Lo que gira el botón **Avanzar**, a la derecha |
+| **Ángulo de retroceso** | De 0 a 360 grados. Lo que gira el botón **Retroceder**, a la izquierda |
+
+Junto a cada ángulo aparecen los pasos que son: el ángulo entre 360 por `PULSOS_POR_VUELTA`, redondeado al paso más cercano. Con 200 pulsos por vuelta, cada paso son 1,8 grados y 90 grados son 50 pasos. El navegador recuerda los dos ángulos. Debajo está el botón **Parar**. La línea de estado muestra si el motor está girando y cuántos pulsos le quedan.
 
 Mientras el motor gira, las órdenes de mover se rechazan con un aviso. Hay que esperar a que termine o pulsar Parar.
 
@@ -192,11 +199,12 @@ En una activación en serie, el segundo relé espera apagado su turno. Una orden
 
 ### Disparo
 
-El bloque naranja junta el motor y los relés. El botón **Realizar disparo** hace tres cosas seguidas:
+El bloque naranja junta el motor y los relés. El botón **Realizar disparo** hace cuatro cosas seguidas:
 
-1. Gira las vueltas de la casilla **Número de vueltas**, de arriba, en el sentido elegido. Valen fracciones de vuelta, por ejemplo 0,1.
-2. Cuando el giro termina, espera 1 segundo (`DISPARO_ESPERA_MS`).
-3. Enciende los relés según la opción marcada debajo, cada uno con el tiempo de su casilla.
+1. Avanza el **Ángulo de avance**, a la derecha.
+2. Retrocede el **Ángulo de retroceso**, a la izquierda. Con 0 grados se lo salta.
+3. Cuando el giro termina, espera 1 segundo (`DISPARO_ESPERA_MS`).
+4. Enciende los relés según la opción marcada debajo, cada uno con el tiempo de su casilla.
 
 | Opción | Qué hace al disparar |
 |---|---|
@@ -205,7 +213,18 @@ El bloque naranja junta el motor y los relés. El botón **Realizar disparo** ha
 | **Relé 1 y luego 2** | Enciende el relé 1 y, al apagarse, el relé 2 |
 | **Relé 2 y luego 1** | Enciende el relé 2 y, al apagarse, el relé 1 |
 
-Debajo se elige el sentido del giro, a la derecha por defecto. **Parar**, una orden de girar o un cambio de modo con BOOT cancelan el disparo mientras gira o espera; si los relés ya se han encendido, siguen hasta acabar su tiempo. Mientras el motor gira, un disparo nuevo se rechaza, igual que las órdenes de mover.
+**Parar**, una orden de girar o un cambio de modo con BOOT cancelan el disparo mientras gira o espera; si los relés ya se han encendido, siguen hasta acabar su tiempo. Mientras el motor gira, un disparo nuevo se rechaza, igual que las órdenes de mover.
+
+### Sensor de pienso (maqueta)
+
+El sensor aún no está conectado: el bloque morado deja preparada la parte de la página.
+
+- La casilla **Disparo automático al detectar pienso** activa o desactiva la secuencia automática.
+- Las cuatro opciones de debajo eligen qué relés se encienden: relé 1, relé 2, 1 y luego 2, o 2 y luego 1. Se usan los tiempos de las casillas de los relés.
+- La selección se guarda en la memoria del ESP32 cada vez que cambia la casilla, la opción o un tiempo de relé, y se mantiene al apagarlo.
+- **Simular detección** hace como si el sensor hubiera visto pienso: si la secuencia está activada, la lanza. El punto gris se pone verde 2 segundos con cada detección.
+
+Cuando haya sensor, se leerá en `loop()` y, al detectar pienso, se llamará a `piensoDetectado()`, la misma función que usa el botón.
 
 La línea de estado indica si el motor gira o está parado, con o sin corriente, en qué fase está el disparo, si cada relé está encendido y cuánto le queda y, durante una serie, qué relé se enciende después y durante cuánto tiempo.
 
@@ -220,8 +239,11 @@ La página usa estas direcciones, que también se pueden llamar desde otro progr
 | `GET /parar` | Para el motor |
 | `GET /rele?n=1&segundos=1` | Enciende el relé 1 ese tiempo y luego se apaga solo. Con `n=2`, el relé 2. Sin `n`, el relé 1 |
 | `GET /serie?orden=12&segundos1=1&segundos2=3` | Activación en serie: el relé 1 durante `segundos1` y, al apagarse, el relé 2 durante `segundos2`. Con `orden=21`, primero el relé 2. `segundos1` es siempre el tiempo del relé 1 |
-| `GET /disparo?vueltas=0.1&sentido=der&modo=12&segundos1=1&segundos2=3` | Disparo: gira 0,1 vueltas a la derecha, espera `DISPARO_ESPERA_MS` y enciende los relés según `modo`: `1`, `2`, `12` (relé 1 y luego relé 2) o `21` (relé 2 y luego relé 1). `segundos1` y `segundos2` son los tiempos del relé 1 y del relé 2 |
-| `GET /estado` | Devuelve el estado en JSON: si se mueve, pulsos pendientes, sentido, pulsos por vuelta, si el motor tiene corriente, si cada relé está encendido y cuánto le queda (`rele`, `rele_ms_restantes`, `rele2`, `rele2_ms_restantes`) y, en una serie, qué relé va después y su tiempo (`serie_siguiente`, `serie_ms`; 0 si no hay serie), y la fase del disparo (`disparo`: `girando`, `esperando` o vacío) con su modo (`disparo_modo`) |
+| `GET /velocidad?rpm=120` | Cambia la velocidad, de `RPM_MIN` a `RPM_MAX` vueltas por minuto. Vale también para el giro en curso |
+| `GET /disparo?vueltas=0.25&sentido=der&retroceso=0.125&modo=12&segundos1=1&segundos2=3` | Disparo: gira 0,25 vueltas a la derecha, retrocede 0,125 vueltas (opcional; sin `retroceso` o con 0 no retrocede), espera `DISPARO_ESPERA_MS` y enciende los relés según `modo`: `1`, `2`, `12` (relé 1 y luego relé 2) o `21` (relé 2 y luego relé 1). `segundos1` y `segundos2` son los tiempos del relé 1 y del relé 2 |
+| `GET /automatico?activo=1&modo=21&segundos1=1&segundos2=3` | Guarda la secuencia automática del sensor de pienso: activada (1) o no (0), modo de los relés y sus tiempos. Se mantiene al apagar el ESP32 |
+| `GET /pienso` | Simula que el sensor detecta pienso: si la secuencia automática está activada, la lanza |
+| `GET /estado` | Devuelve el estado en JSON: si se mueve, pulsos pendientes, sentido, pulsos por vuelta, si el motor tiene corriente, si cada relé está encendido y cuánto le queda (`rele`, `rele_ms_restantes`, `rele2`, `rele2_ms_restantes`) y, en una serie, qué relé va después y su tiempo (`serie_siguiente`, `serie_ms`; 0 si no hay serie), la fase del disparo (`disparo`: `girando` mientras avanza, `retrocediendo`, `esperando` o vacío) con su modo (`disparo_modo`), la velocidad (`rpm`), la secuencia automática (`auto_activo`, `auto_modo`) y las detecciones de pienso desde el arranque (`pienso_detecciones`) |
 
 ## El servidor web
 

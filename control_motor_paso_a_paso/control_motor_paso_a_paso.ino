@@ -6,8 +6,14 @@
   un driver de entradas STEP y DIR (A4988, DRV8825, TMC2208, TB6600, DM542...)
   y encender dos reles temporizados: cada uno por su lado o los dos en serie
   (primero uno durante su tiempo y, al apagarse, el otro durante el suyo).
-  El DISPARO junta las dos cosas: gira las vueltas indicadas, espera
+  El giro se elige en la web con tres deslizadores: velocidad (rpm), angulo
+  de avance (a la derecha) y angulo de retroceso (a la izquierda), de 0 a 360
+  grados cada uno.
+  El DISPARO junta las dos cosas: avanza su angulo, retrocede el suyo, espera
   DISPARO_ESPERA_MS y enciende el rele 1, el 2, o los dos en serie.
+  SENSOR DE PIENSO (maqueta, sin sensor aun): la web deja elegida la
+  secuencia de reles que se lanzara sola al detectar pienso; se guarda en la
+  memoria del ESP32 y se prueba con el boton "Simular deteccion".
 
   MODOS WIFI
     - Al arrancar crea su propia red ESP32_MOTOR (modo AP), web en
@@ -71,6 +77,7 @@
 #include "esp_timer.h"        // temporizador de los pulsos (viene con el core ESP32)
 #include "esp_http_server.h"  // servidor web del sistema del ESP32 (viene con el core)
 #include "lwip/sockets.h"     // para saber la IP de quien hace cada peticion
+#include <Preferences.h>      // memoria que no se borra al apagar (viene con el core)
 
 // Redes WiFi: WIFI_ROUTER_SSID / WIFI_ROUTER_PASSWORD (la primera que se
 // prueba) y WIFI_ROUTER2_SSID / WIFI_ROUTER2_PASSWORD (la segunda, opcional)
@@ -115,9 +122,13 @@
 #define RELE_TIEMPO_S       1       // tiempo por defecto en la web, en segundos (los dos reles)
 #define RELE_MAX_S          600     // tiempo maximo por orden, en segundos
 
-// Disparo: el motor gira las vueltas del campo, se para, espera este tiempo
-// y enciende los reles segun el modo elegido en la web.
+// Disparo: el motor avanza, retrocede, se para, espera este tiempo y
+// enciende los reles segun el modo elegido en la web.
 #define DISPARO_ESPERA_MS   1000
+
+// Sensor de pienso: PENDIENTE. De momento la web solo guarda la secuencia
+// automatica y el boton "Simular deteccion" la lanza. Cuando haya sensor,
+// leerlo en loop() y llamar a piensoDetectado() al detectar.
 
 // Pulsos que necesita el driver para una vuelta completa del motor.
 // Motor de 200 pasos sin microstepping = 200.
@@ -129,7 +140,15 @@
 // es decir 2,5 vueltas por segundo con 200 pulsos por vuelta.
 // Menos tiempo = mas velocidad. Si el motor vibra sin girar o pierde pasos,
 // aumenta este valor.
+// Es la velocidad al arrancar: 1000 us con 200 pulsos por vuelta son 150 rpm.
+// Despues se cambia con el deslizador de velocidad de la web.
 #define PULSO_US            1000
+
+// Limites del deslizador de velocidad, en vueltas por minuto. Sin rampa de
+// aceleracion, a mucha velocidad el motor puede perder pasos: si pasa, baja
+// RPM_MAX.
+#define RPM_MIN             10
+#define RPM_MAX             300
 
 // LED de estado de la WiFi (el LED azul de la placa suele estar en GPIO 2):
 //   parpadeo                  = modo AP, red propia ESP32_MOTOR
@@ -218,6 +237,8 @@ bool sentidoDerecha = true;           // sentido del movimiento en curso
 bool temporizadorEnMarcha = false;
 bool driverActivo = false;            // true = bobinas con corriente
 unsigned long finMovimiento = 0;      // instante (millis) en que paro el motor
+unsigned long pulsoUs = PULSO_US;     // periodo del temporizador: fija la velocidad
+int rpmActual = 0;                    // velocidad en vueltas por minuto (se calcula en setup)
 
 // Estado de cada rele (reles[0] es el rele 1 y reles[1] el rele 2)
 struct Rele {
@@ -238,13 +259,23 @@ int serieTras = -1;
 int serieSiguiente = -1;
 unsigned long serieMs = 0;
 
-// Disparo: giro, espera de DISPARO_ESPERA_MS y reles. disparoModo: "1", "2",
-// "12" (rele 1 y luego rele 2) o "21" (rele 2 y luego rele 1).
-enum FaseDisparo { DISPARO_NO, DISPARO_GIRANDO, DISPARO_ESPERANDO };
+// Disparo: avance, retroceso (si lo hay), espera de DISPARO_ESPERA_MS y
+// reles. disparoModo: "1", "2", "12" (rele 1 y luego rele 2) o "21" (rele 2
+// y luego rele 1).
+enum FaseDisparo { DISPARO_NO, DISPARO_GIRANDO, DISPARO_RETROCEDIENDO, DISPARO_ESPERANDO };
 FaseDisparo faseDisparo = DISPARO_NO;
 String disparoModo = "";
 unsigned long disparoMs1 = 0, disparoMs2 = 0;   // tiempo del rele 1 y del rele 2
+long disparoPulsosRetroceso = 0;                // 0 = sin retroceso
+bool disparoDerecha = true;                     // sentido del avance
 unsigned long disparoEsperaInicio = 0;          // instante (millis) en que paro el giro
+
+// Secuencia automatica al detectar pienso (se guarda en la memoria del ESP32)
+Preferences ajustes;
+bool autoActivo = false;
+String autoModo = "1";                          // mismos modos que el disparo
+unsigned long autoMs1 = RELE_TIEMPO_S * 1000UL, autoMs2 = RELE_TIEMPO_S * 1000UL;
+unsigned long piensoDetecciones = 0;            // detecciones desde el arranque
 
 esp_timer_handle_t temporizadorPasos;
 portMUX_TYPE candadoMotor = portMUX_INITIALIZER_UNLOCKED;  // evita que el
@@ -425,8 +456,21 @@ void moverMotor(long pulsos, bool direccion) {
   stepEnAlto = false;
   pulsosPendientes = pulsos;
   portEXIT_CRITICAL(&candadoMotor);
-  esp_timer_start_periodic(temporizadorPasos, PULSO_US);
+  esp_timer_start_periodic(temporizadorPasos, pulsoUs);
   temporizadorEnMarcha = true;
+}
+
+// Cambia la velocidad a 'rpm' vueltas por minuto (de RPM_MIN a RPM_MAX). Si
+// el motor esta girando, el cambio vale ya para los pulsos que faltan.
+void cambiarVelocidad(int rpm) {
+  rpmActual = rpm;
+  // medio periodo = 60 s / (rpm * pulsos por vuelta) / 2
+  pulsoUs = 30000000UL / ((unsigned long)rpm * PULSOS_POR_VUELTA);
+  if (pulsoUs < 50) pulsoUs = 50;     // minimo del temporizador del ESP32
+  if (temporizadorEnMarcha) {
+    esp_timer_stop(temporizadorPasos);
+    esp_timer_start_periodic(temporizadorPasos, pulsoUs);
+  }
 }
 
 // Detiene el motor inmediatamente.
@@ -515,10 +559,16 @@ void cancelarDisparo() {
   faseDisparo = DISPARO_NO;
 }
 
-// Se llama en loop(), despues de comprobarFinMovimiento(): cuando el giro del
-// disparo termina, espera DISPARO_ESPERA_MS y enciende los reles. No bloquea.
+// Se llama en loop(), despues de comprobarFinMovimiento(): cuando el avance
+// del disparo termina, retrocede (si hay retroceso); al acabar, espera
+// DISPARO_ESPERA_MS y enciende los reles. No bloquea.
 void comprobarDisparo() {
-  if (faseDisparo == DISPARO_GIRANDO && !temporizadorEnMarcha && pulsosPendientes == 0) {
+  bool giroAcabado = !temporizadorEnMarcha && pulsosPendientes == 0;
+  if (faseDisparo == DISPARO_GIRANDO && giroAcabado && disparoPulsosRetroceso > 0) {
+    faseDisparo = DISPARO_RETROCEDIENDO;
+    moverMotor(disparoPulsosRetroceso, !disparoDerecha);
+    aviso("[disparo] avance terminado: retrocedo " + String(disparoPulsosRetroceso) + " pulsos");
+  } else if ((faseDisparo == DISPARO_GIRANDO || faseDisparo == DISPARO_RETROCEDIENDO) && giroAcabado) {
     faseDisparo = DISPARO_ESPERANDO;
     disparoEsperaInicio = millis();
     aviso("[disparo] giro terminado: espero " + String(DISPARO_ESPERA_MS) + " ms");
@@ -528,6 +578,37 @@ void comprobarDisparo() {
     encenderModo(disparoModo, disparoMs1, disparoMs2);
     aviso("[disparo] disparo: reles en modo " + disparoModo);
   }
+}
+
+// Pienso detectado: si la secuencia automatica esta activada, enciende los
+// reles segun el modo guardado. De momento solo la llama el boton "Simular
+// deteccion"; cuando haya sensor, la llamara loop(). Devuelve true si disparo.
+bool piensoDetectado(const char* origen) {
+  piensoDetecciones++;
+  if (!autoActivo) {
+    aviso(String("[pienso] detectado (") + origen + "): secuencia automatica desactivada");
+    return false;
+  }
+  encenderModo(autoModo, autoMs1, autoMs2);
+  aviso(String("[pienso] detectado (") + origen + "): reles en modo " + autoModo);
+  return true;
+}
+
+// Guarda la secuencia automatica en la memoria del ESP32 (no se borra al apagar).
+void guardarAutomatico() {
+  ajustes.putBool("auto_activo", autoActivo);
+  ajustes.putString("auto_modo", autoModo);
+  ajustes.putULong("auto_ms1", autoMs1);
+  ajustes.putULong("auto_ms2", autoMs2);
+}
+
+// Lee la secuencia automatica guardada (en setup).
+void leerAutomatico() {
+  autoActivo = ajustes.getBool("auto_activo", false);
+  autoModo = ajustes.getString("auto_modo", "1");
+  if (autoModo != "1" && autoModo != "2" && autoModo != "12" && autoModo != "21") autoModo = "1";
+  autoMs1 = ajustes.getULong("auto_ms1", RELE_TIEMPO_S * 1000UL);
+  autoMs2 = ajustes.getULong("auto_ms2", RELE_TIEMPO_S * 1000UL);
 }
 
 // Se llama en loop(): apaga cada rele cuando ha pasado su tiempo y, si era el
@@ -553,7 +634,8 @@ void comprobarReles() {
 //  PAGINA WEB
 // ---------------------------------------------------------------------
 
-// %PPV%, %RELE_S% y %ESPERA_S% se sustituyen al enviar la pagina (paginaPrincipal).
+// %PPV%, %RELE_S%, %ESPERA_S%, %RPM%, %RPM_MIN%, %RPM_MAX% y %GRADOS_PASO%
+// se sustituyen al enviar la pagina (paginaPrincipal).
 const char PAGINA[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html lang="es">
@@ -587,6 +669,19 @@ const char PAGINA[] PROGMEM = R"rawliteral(
   .rele-fila { display: flex; gap: 10px; align-items: flex-end; }
   .rele-fila > div { flex: 1; }
   .rele-fila button { margin-top: 0; }
+  .deslizador { margin-bottom: 14px; }
+  .deslizador label { display: flex; justify-content: space-between; }
+  .deslizador b { font-size: 1.15em; }
+  input[type=range] { padding: 0; height: 32px; accent-color: #1565c0; }
+  .limites { display: flex; justify-content: space-between; font-size: 0.8em; color: #777; }
+  .nota { font-size: 0.85em; color: #666; margin-top: 8px; }
+  .sensor { display: flex; align-items: center; gap: 10px; }
+  .piloto { width: 18px; height: 18px; border-radius: 50%; background: #bbb; flex: none; }
+  .piloto.activo { background: #2e7d32; box-shadow: 0 0 8px #2e7d32; }
+  .interruptor { display: flex; align-items: center; gap: 10px; margin: 12px 0 0; cursor: pointer; }
+  .interruptor input { width: 22px; height: 22px; margin: 0; }
+  .opciones.apagadas { opacity: 0.45; }
+  button.sensor-boton { background: #6a1b9a; }
   #estado { font-weight: bold; }
 </style>
 </head>
@@ -596,31 +691,42 @@ const char PAGINA[] PROGMEM = R"rawliteral(
   <div class="caja">Pulsos por vuelta: <b>%PPV%</b></div>
 
   <div class="caja">
-    <label for="vueltas">Número de vueltas</label>
-    <input id="vueltas" type="number" min="0" step="any" value="1" inputmode="decimal">
-    <div class="fila">
-      <button onclick="girar('izq')">Girar izquierda</button>
-      <button onclick="girar('der')">Girar derecha</button>
+    <div class="deslizador">
+      <label for="rpm"><span>Velocidad</span><b><span id="rpmTexto">%RPM%</span> rpm</b></label>
+      <input id="rpm" type="range" min="%RPM_MIN%" max="%RPM_MAX%" step="5" value="%RPM%"
+             oninput="verVelocidad()" onchange="enviarVelocidad()">
+      <div class="limites"><span>%RPM_MIN%</span><span>%RPM_MAX%</span></div>
+    </div>
+    <div class="deslizador">
+      <label for="avance"><span>Ángulo de avance</span><b id="avanceTexto">-</b></label>
+      <input id="avance" type="range" min="0" max="360" step="1" value="90" oninput="verAngulos()">
+      <div class="limites"><span>0°</span><span>360°</span></div>
+    </div>
+    <div class="deslizador">
+      <label for="retroceso"><span>Ángulo de retroceso</span><b id="retrocesoTexto">-</b></label>
+      <input id="retroceso" type="range" min="0" max="360" step="1" value="0" oninput="verAngulos()">
+      <div class="limites"><span>0°</span><span>360°</span></div>
     </div>
     <div class="fila">
-      <button onclick="girar('izq', 1)">1 vuelta izquierda</button>
-      <button onclick="girar('der', 1)">1 vuelta derecha</button>
+      <button onclick="girar('izq')">Retroceder</button>
+      <button onclick="girar('der')">Avanzar</button>
     </div>
     <button class="parar" onclick="parar(5)">Parar</button>
+    <div class="nota">Avanzar gira a la derecha y retroceder a la izquierda. Cada paso son %GRADOS_PASO%°.</div>
   </div>
 
   <div class="caja">
     <div class="rele-fila">
       <div>
         <label for="segundos1">Relé 1 (segundos)</label>
-        <input id="segundos1" type="number" min="0" step="any" value="%RELE_S%" inputmode="decimal">
+        <input id="segundos1" type="number" min="0" step="any" value="%RELE_S%" inputmode="decimal" onchange="guardarAutomatico()">
       </div>
       <button class="rele" onclick="activarRele('1')">Activar relé 1</button>
     </div>
     <div class="rele-fila" style="margin-top: 12px">
       <div>
         <label for="segundos2">Relé 2 (segundos)</label>
-        <input id="segundos2" type="number" min="0" step="any" value="%RELE_S%" inputmode="decimal">
+        <input id="segundos2" type="number" min="0" step="any" value="%RELE_S%" inputmode="decimal" onchange="guardarAutomatico()">
       </div>
       <button class="rele" onclick="activarRele('2')">Activar relé 2</button>
     </div>
@@ -632,18 +738,31 @@ const char PAGINA[] PROGMEM = R"rawliteral(
 
   <div class="caja">
     <button class="disparo" style="margin-top: 0" onclick="disparar()">Realizar disparo</button>
-    <div class="titulo-opciones">Gira las vueltas de arriba, espera %ESPERA_S% s y dispara con:</div>
+    <div class="titulo-opciones">Avanza el ángulo de avance, retrocede el de retroceso, espera %ESPERA_S% s y dispara con:</div>
     <div class="opciones">
       <label><input type="radio" name="modo" value="1" checked><span>Relé 1</span></label>
       <label><input type="radio" name="modo" value="2"><span>Relé 2</span></label>
       <label><input type="radio" name="modo" value="12"><span>Relé 1 y luego 2</span></label>
       <label><input type="radio" name="modo" value="21"><span>Relé 2 y luego 1</span></label>
     </div>
-    <div class="titulo-opciones">Sentido del giro:</div>
-    <div class="opciones">
-      <label><input type="radio" name="sentidoDisparo" value="izq"><span>Izquierda</span></label>
-      <label><input type="radio" name="sentidoDisparo" value="der" checked><span>Derecha</span></label>
+  </div>
+
+  <div class="caja">
+    <div class="sensor">
+      <span class="piloto" id="piloto"></span>
+      <div><b>Sensor de pienso</b><br><span id="sensorTexto">sin sensor conectado (maqueta)</span></div>
     </div>
+    <label class="interruptor"><input type="checkbox" id="autoActivo" onchange="guardarAutomatico()">
+      Disparo automático al detectar pienso</label>
+    <div class="titulo-opciones">Secuencia que se lanza sola, con los tiempos de los relés de arriba:</div>
+    <div class="opciones" id="autoOpciones">
+      <label><input type="radio" name="autoModo" value="1" checked onchange="guardarAutomatico()"><span>Relé 1</span></label>
+      <label><input type="radio" name="autoModo" value="2" onchange="guardarAutomatico()"><span>Relé 2</span></label>
+      <label><input type="radio" name="autoModo" value="12" onchange="guardarAutomatico()"><span>Relé 1 y luego 2</span></label>
+      <label><input type="radio" name="autoModo" value="21" onchange="guardarAutomatico()"><span>Relé 2 y luego 1</span></label>
+    </div>
+    <button class="sensor-boton" onclick="orden('/pienso')">Simular detección</button>
+    <div class="nota">La selección se guarda en el ESP32 y se mantiene al apagarlo.</div>
   </div>
 
   <div class="caja">
@@ -664,12 +783,40 @@ const char PAGINA[] PROGMEM = R"rawliteral(
       .catch(() => { document.getElementById('mensaje').textContent = 'Sin conexión con el ESP32'; });
   }
 
-  // Sin 'vueltas' usa el valor del campo; con 'vueltas' = 1 es el boton de 1 vuelta
-  function girar(sentido, vueltas) {
-    if (vueltas === undefined) {
-      vueltas = document.getElementById('vueltas').value.replace(',', '.');
+  var PPV = %PPV%;
+
+  // Velocidad: el numero cambia al mover el deslizador y la orden se envia al soltarlo
+  function verVelocidad() {
+    document.getElementById('rpmTexto').textContent = document.getElementById('rpm').value;
+  }
+  function enviarVelocidad() {
+    orden('/velocidad?rpm=' + document.getElementById('rpm').value);
+  }
+
+  // Angulos en grados (0 a 360) y su equivalente en vueltas y pasos
+  function grados(id) { return parseInt(document.getElementById(id).value, 10); }
+  function vueltasDe(g) { return (g / 360).toFixed(4); }
+  function verAngulos() {
+    ['avance', 'retroceso'].forEach(id => {
+      var g = grados(id);
+      document.getElementById(id + 'Texto').textContent = g + '° (' + Math.round(g / 360 * PPV) + ' pasos)';
+    });
+    try { localStorage.setItem('angulos', JSON.stringify([grados('avance'), grados('retroceso')])); } catch (e) {}
+  }
+  try {
+    var guardados = JSON.parse(localStorage.getItem('angulos'));
+    if (guardados) { document.getElementById('avance').value = guardados[0]; document.getElementById('retroceso').value = guardados[1]; }
+  } catch (e) {}
+  verAngulos();
+
+  // 'der' avanza el angulo de avance; 'izq' retrocede el angulo de retroceso
+  function girar(sentido) {
+    var g = grados(sentido === 'der' ? 'avance' : 'retroceso');
+    if (Math.round(g / 360 * PPV) < 1) {
+      document.getElementById('mensaje').textContent = 'El ángulo es 0: no hay nada que girar.';
+      return;
     }
-    orden('/mover?vueltas=' + encodeURIComponent(vueltas) + '&sentido=' + sentido);
+    orden('/mover?vueltas=' + vueltasDe(g) + '&sentido=' + sentido);
   }
 
   // Orden de parar. Si no llega al ESP32, se reintenta hasta 'intentos' veces.
@@ -691,13 +838,31 @@ const char PAGINA[] PROGMEM = R"rawliteral(
     orden('/rele?n=' + n + '&segundos=' + segundosRele(n));
   }
 
-  // Disparo: gira las vueltas del campo en el sentido elegido, espera 1 s y
+  // Disparo: avanza el angulo de avance, retrocede el de retroceso, espera y
   // enciende los reles en el modo elegido, cada uno con los segundos de su campo
   function disparar() {
-    var vueltas = document.getElementById('vueltas').value.replace(',', '.');
+    if (Math.round(grados('avance') / 360 * PPV) < 1) {
+      document.getElementById('mensaje').textContent = 'El ángulo de avance es 0: el disparo necesita avanzar.';
+      return;
+    }
     var modo = document.querySelector('input[name=modo]:checked').value;
-    var sentido = document.querySelector('input[name=sentidoDisparo]:checked').value;
-    orden('/disparo?vueltas=' + encodeURIComponent(vueltas) + '&sentido=' + sentido + '&modo=' + modo +
+    orden('/disparo?vueltas=' + vueltasDe(grados('avance')) + '&sentido=der' +
+          '&retroceso=' + vueltasDe(grados('retroceso')) + '&modo=' + modo +
+          '&segundos1=' + segundosRele(1) + '&segundos2=' + segundosRele(2));
+  }
+
+  // Secuencia automatica del sensor de pienso. Se guarda en el ESP32 al
+  // cambiar la casilla, la opcion o los tiempos de los reles (no antes de
+  // haber leido lo guardado, para no pisarlo al abrir la pagina).
+  var automaticoLeido = false;
+  function verAutomatico() {
+    document.getElementById('autoOpciones').classList.toggle('apagadas', !document.getElementById('autoActivo').checked);
+  }
+  function guardarAutomatico() {
+    verAutomatico();
+    if (!automaticoLeido) return;
+    var modo = document.querySelector('input[name=autoModo]:checked').value;
+    orden('/automatico?activo=' + (document.getElementById('autoActivo').checked ? 1 : 0) + '&modo=' + modo +
           '&segundos1=' + segundosRele(1) + '&segundos2=' + segundosRele(2));
   }
 
@@ -713,6 +878,7 @@ const char PAGINA[] PROGMEM = R"rawliteral(
   }
 
   // Consulta el estado del motor cada segundo
+  var detecciones = null;
   function leerEstado() {
     fetch('/estado')
       .then(r => r.json())
@@ -722,9 +888,28 @@ const char PAGINA[] PROGMEM = R"rawliteral(
           : (e.con_corriente ? 'parado, con corriente' : 'parado, sin corriente');
         var modos = { '1': 'relé 1', '2': 'relé 2', '12': 'relé 1 y luego 2', '21': 'relé 2 y luego 1' };
         document.getElementById('disparo').textContent =
-          e.disparo === 'girando' ? 'girando, después dispara con ' + modos[e.disparo_modo]
+          e.disparo === 'girando' ? 'avanzando, después dispara con ' + modos[e.disparo_modo]
+          : e.disparo === 'retrocediendo' ? 'retrocediendo, después dispara con ' + modos[e.disparo_modo]
           : e.disparo === 'esperando' ? 'esperando para disparar con ' + modos[e.disparo_modo]
           : 'listo';
+        // La primera vez, los controles toman lo que tiene el ESP32
+        if (!automaticoLeido) {
+          document.getElementById('rpm').value = e.rpm;
+          verVelocidad();
+          document.getElementById('autoActivo').checked = e.auto_activo;
+          document.querySelector('input[name=autoModo][value="' + e.auto_modo + '"]').checked = true;
+          verAutomatico();
+          automaticoLeido = true;
+        }
+        // Piloto del sensor: se enciende 2 s con cada deteccion nueva
+        document.getElementById('sensorTexto').textContent = 'sin sensor conectado (maqueta)' +
+          (e.pienso_detecciones ? ', ' + e.pienso_detecciones + ' detecciones simuladas' : '');
+        if (detecciones !== null && e.pienso_detecciones > detecciones) {
+          var piloto = document.getElementById('piloto');
+          piloto.classList.add('activo');
+          setTimeout(() => piloto.classList.remove('activo'), 2000);
+        }
+        detecciones = e.pienso_detecciones;
         document.getElementById('rele1').textContent = textoRele(e.rele, e.rele_ms_restantes);
         document.getElementById('rele2').textContent = textoRele(e.rele2, e.rele2_ms_restantes);
         document.getElementById('serie').innerHTML = e.serie_siguiente
@@ -756,6 +941,17 @@ esp_err_t paginaPrincipal(httpd_req_t* req) {
   html.replace("%PPV%", String(PULSOS_POR_VUELTA));
   html.replace("%RELE_S%", String(RELE_TIEMPO_S));
   html.replace("%ESPERA_S%", String(DISPARO_ESPERA_MS / 1000.0, DISPARO_ESPERA_MS % 1000 ? 1 : 0));
+  xSemaphoreTake(candadoEstado, portMAX_DELAY);
+  int rpm = rpmActual;
+  xSemaphoreGive(candadoEstado);
+  html.replace("%RPM%", String(rpm));
+  html.replace("%RPM_MIN%", String(RPM_MIN));
+  html.replace("%RPM_MAX%", String(RPM_MAX));
+  String gradosPaso = String(360.0 / PULSOS_POR_VUELTA, 3);   // 1.800 -> 1,8
+  while (gradosPaso.endsWith("0")) gradosPaso.remove(gradosPaso.length() - 1);
+  if (gradosPaso.endsWith(".")) gradosPaso.remove(gradosPaso.length() - 1);
+  gradosPaso.replace(".", ",");
+  html.replace("%GRADOS_PASO%", gradosPaso);
   return responder(req, 200, "text/html; charset=utf-8", html);
 }
 
@@ -803,9 +999,9 @@ esp_err_t ordenMover(httpd_req_t* req) {
     return responder(req, 409, "text/plain; charset=utf-8",
                      "El motor está girando. Espera a que termine o pulsa Parar.");
   }
-  String mensaje = "Girando ";
-  mensaje += String(vueltas, 2);
-  mensaje += derecha ? " vueltas a la derecha (" : " vueltas a la izquierda (";
+  String mensaje = derecha ? "Avanzando " : "Retrocediendo ";
+  mensaje += String(vueltas * 360, 0);
+  mensaje += derecha ? "° a la derecha (" : "° a la izquierda (";
   mensaje += pulsos;
   mensaje += " pulsos)";
   return responder(req, 200, "text/plain; charset=utf-8", mensaje);
@@ -891,14 +1087,41 @@ esp_err_t ordenSerie(httpd_req_t* req) {
   return responder(req, 200, "text/plain; charset=utf-8", mensaje);
 }
 
-// GET /disparo?vueltas=0.1&sentido=der&modo=12&segundos1=1&segundos2=3
-//   -> gira 0,1 vueltas a la derecha, espera DISPARO_ESPERA_MS y enciende los
-//      reles segun 'modo': 1, 2, 12 (rele 1 y luego rele 2) o 21 (al reves),
-//      el rele 1 durante segundos1 y el rele 2 durante segundos2.
+// GET /velocidad?rpm=120  -> cambia la velocidad (de RPM_MIN a RPM_MAX vueltas
+// por minuto). Vale tambien para el giro en curso.
+esp_err_t ordenVelocidad(httpd_req_t* req) {
+  int rpm = argumento(req, "rpm").toInt();
+  if (rpm < RPM_MIN || rpm > RPM_MAX) {
+    String error = "Velocidad no válida (entre ";
+    error += RPM_MIN;
+    error += " y ";
+    error += RPM_MAX;
+    error += " rpm).";
+    return responder(req, 400, "text/plain; charset=utf-8", error);
+  }
+  xSemaphoreTake(candadoEstado, portMAX_DELAY);
+  cambiarVelocidad(rpm);
+  xSemaphoreGive(candadoEstado);
+  return responder(req, 200, "text/plain; charset=utf-8", "Velocidad: " + String(rpm) + " rpm");
+}
+
+// GET /disparo?vueltas=0.25&sentido=der&retroceso=0.1&modo=12&segundos1=1&segundos2=3
+//   -> avanza 0,25 vueltas a la derecha, retrocede 0,1 vueltas (opcional; sin
+//      retroceso o con 0 no retrocede), espera DISPARO_ESPERA_MS y enciende
+//      los reles segun 'modo': 1, 2, 12 (rele 1 y luego rele 2) o 21 (al
+//      reves), el rele 1 durante segundos1 y el rele 2 durante segundos2.
 esp_err_t ordenDisparo(httpd_req_t* req) {
   float vueltas; long pulsos; bool derecha;
   String error = leerGiro(req, vueltas, pulsos, derecha);
   if (error != "") return responder(req, 400, "text/plain; charset=utf-8", error);
+  String textoRetroceso = argumento(req, "retroceso");
+  textoRetroceso.replace(",", ".");
+  textoRetroceso.replace("%2C", ".");
+  float retroceso = textoRetroceso.toFloat();
+  if (retroceso < 0 || retroceso > VUELTAS_MAX) {
+    return responder(req, 400, "text/plain; charset=utf-8", "Retroceso no válido.");
+  }
+  long pulsosRetroceso = (long)(retroceso * PULSOS_POR_VUELTA + 0.5f);
   String modo = argumento(req, "modo");
   if (modo != "1" && modo != "2" && modo != "12" && modo != "21") {
     return responder(req, 400, "text/plain; charset=utf-8", "Modo de disparo no válido: 1, 2, 12 o 21.");
@@ -915,6 +1138,8 @@ esp_err_t ordenDisparo(httpd_req_t* req) {
     disparoModo = modo;
     disparoMs1 = (unsigned long)(s1 * 1000 + 0.5f);
     disparoMs2 = (unsigned long)(s2 * 1000 + 0.5f);
+    disparoPulsosRetroceso = pulsosRetroceso;
+    disparoDerecha = derecha;
     faseDisparo = DISPARO_GIRANDO;
     moverMotor(pulsos, derecha);
   }
@@ -925,8 +1150,13 @@ esp_err_t ordenDisparo(httpd_req_t* req) {
                      "El motor está girando. Espera a que termine o pulsa Parar.");
   }
   String mensaje = "Disparo: ";
-  mensaje += String(vueltas, 2);
-  mensaje += derecha ? " vueltas a la derecha, espera de " : " vueltas a la izquierda, espera de ";
+  mensaje += String(vueltas * 360, 0);
+  mensaje += derecha ? "° a la derecha, " : "° a la izquierda, ";
+  if (pulsosRetroceso > 0) {
+    mensaje += String(retroceso * 360, 0);
+    mensaje += "° de vuelta, ";
+  }
+  mensaje += "espera de ";
   mensaje += String(DISPARO_ESPERA_MS / 1000.0, 1);
   mensaje += " s y ";
   if (modo == "1") mensaje += "relé 1";
@@ -936,13 +1166,63 @@ esp_err_t ordenDisparo(httpd_req_t* req) {
   return responder(req, 200, "text/plain; charset=utf-8", mensaje);
 }
 
+// GET /automatico?activo=1&modo=12&segundos1=1&segundos2=3
+//   -> guarda la secuencia que se lanza sola al detectar pienso: activada o
+//      no, modo de los reles (1, 2, 12 o 21) y sus tiempos. Se mantiene al
+//      apagar el ESP32.
+esp_err_t ordenAutomatico(httpd_req_t* req) {
+  String activo = argumento(req, "activo");
+  if (activo != "0" && activo != "1") {
+    return responder(req, 400, "text/plain; charset=utf-8", "activo tiene que ser 0 o 1.");
+  }
+  String modo = argumento(req, "modo");
+  if (modo != "1" && modo != "2" && modo != "12" && modo != "21") {
+    return responder(req, 400, "text/plain; charset=utf-8", "Modo no válido: 1, 2, 12 o 21.");
+  }
+  float s1 = segundosDe(req, "segundos1");
+  float s2 = segundosDe(req, "segundos2");
+  if (s1 < 0 || s2 < 0) return responder(req, 400, "text/plain; charset=utf-8", errorTiempoRele());
+
+  xSemaphoreTake(candadoEstado, portMAX_DELAY);
+  autoActivo = (activo == "1");
+  autoModo = modo;
+  autoMs1 = (unsigned long)(s1 * 1000 + 0.5f);
+  autoMs2 = (unsigned long)(s2 * 1000 + 0.5f);
+  xSemaphoreGive(candadoEstado);
+  guardarAutomatico();   // la memoria se escribe fuera del candado: tarda unos ms
+
+  String mensaje = "Disparo automático ";
+  if (activo == "1") {
+    mensaje += "activado: ";
+    if (modo == "1") mensaje += "relé 1 " + String(s1, 1) + " s";
+    else if (modo == "2") mensaje += "relé 2 " + String(s2, 1) + " s";
+    else if (modo == "12") mensaje += "relé 1 " + String(s1, 1) + " s y luego relé 2 " + String(s2, 1) + " s";
+    else mensaje += "relé 2 " + String(s2, 1) + " s y luego relé 1 " + String(s1, 1) + " s";
+  } else {
+    mensaje += "desactivado";
+  }
+  return responder(req, 200, "text/plain; charset=utf-8", mensaje);
+}
+
+// GET /pienso  -> simula que el sensor detecta pienso (maqueta hasta que haya sensor)
+esp_err_t ordenPienso(httpd_req_t* req) {
+  xSemaphoreTake(candadoEstado, portMAX_DELAY);
+  bool disparado = piensoDetectado("simulado");
+  xSemaphoreGive(candadoEstado);
+  return responder(req, 200, "text/plain; charset=utf-8", disparado
+                   ? "Pienso detectado (simulado): secuencia automática lanzada."
+                   : "Pienso detectado (simulado), pero el disparo automático está desactivado.");
+}
+
 // GET /estado  -> {"moviendo":true,"pulsos_pendientes":120,"sentido":"derecha",
 //                  "pulsos_por_vuelta":200,"con_corriente":true,
 //                  "rele":false,"rele_ms_restantes":0,"rele2":true,"rele2_ms_restantes":2500,
-//                  "serie_siguiente":1,"serie_ms":1500,"disparo":"girando","disparo_modo":"12"}
+//                  "serie_siguiente":1,"serie_ms":1500,"disparo":"girando","disparo_modo":"12",
+//                  "rpm":150,"auto_activo":true,"auto_modo":"21","pienso_detecciones":3}
 // ("rele" y "rele_ms_restantes" son los del rele 1, con los nombres de siempre;
 //  serie_siguiente es el rele que se enciende despues en una serie, 0 si no hay;
-//  disparo es "girando", "esperando" o "" si no hay ninguno pendiente)
+//  disparo es "girando" (avance), "retrocediendo", "esperando" o "" si no hay
+//  ninguno pendiente)
 esp_err_t ordenEstado(httpd_req_t* req) {
   xSemaphoreTake(candadoEstado, portMAX_DELAY);
   long pendientes = pulsosPendientes;
@@ -954,8 +1234,14 @@ esp_err_t ordenEstado(httpd_req_t* req) {
   unsigned long restante2 = releRestante(1);
   int serieSig = serieSiguiente + 1;     // 0 = no hay serie pendiente
   unsigned long msSerie = serieSiguiente >= 0 ? serieMs : 0;
-  const char* fase = faseDisparo == DISPARO_GIRANDO ? "girando" : faseDisparo == DISPARO_ESPERANDO ? "esperando" : "";
+  const char* fase = faseDisparo == DISPARO_GIRANDO ? "girando"
+                   : faseDisparo == DISPARO_RETROCEDIENDO ? "retrocediendo"
+                   : faseDisparo == DISPARO_ESPERANDO ? "esperando" : "";
   String modo = faseDisparo != DISPARO_NO ? disparoModo : "";
+  int rpm = rpmActual;
+  bool automatico = autoActivo;
+  String modoAuto = autoModo;
+  unsigned long detecciones = piensoDetecciones;
   xSemaphoreGive(candadoEstado);
 
   String json = "{\"moviendo\":";
@@ -984,7 +1270,15 @@ esp_err_t ordenEstado(httpd_req_t* req) {
   json += fase;
   json += "\",\"disparo_modo\":\"";
   json += modo;
-  json += "\"}";
+  json += "\",\"rpm\":";
+  json += rpm;
+  json += ",\"auto_activo\":";
+  json += automatico ? "true" : "false";
+  json += ",\"auto_modo\":\"";
+  json += modoAuto;
+  json += "\",\"pienso_detecciones\":";
+  json += detecciones;
+  json += "}";
   return responder(req, 200, "application/json", json);
 }
 
@@ -1003,6 +1297,7 @@ void arrancarServidorWeb() {
   config.max_open_sockets = WEB_MAX_CONEXIONES;
   config.lru_purge_enable = true;   // si se llena, cierra la conexion menos usada
   config.stack_size = 8192;         // margen para construir la pagina y los textos
+  config.max_uri_handlers = 12;     // por defecto solo admite 8 direcciones
 
   if (httpd_start(&servidor, &config) != ESP_OK) {
     aviso("[web] ERROR: no se pudo arrancar el servidor web");
@@ -1016,6 +1311,9 @@ void arrancarServidorWeb() {
     { .uri = "/rele",   .method = HTTP_GET, .handler = ordenRele,       .user_ctx = NULL },
     { .uri = "/serie",  .method = HTTP_GET, .handler = ordenSerie,      .user_ctx = NULL },
     { .uri = "/disparo", .method = HTTP_GET, .handler = ordenDisparo,   .user_ctx = NULL },
+    { .uri = "/velocidad", .method = HTTP_GET, .handler = ordenVelocidad, .user_ctx = NULL },
+    { .uri = "/automatico", .method = HTTP_GET, .handler = ordenAutomatico, .user_ctx = NULL },
+    { .uri = "/pienso", .method = HTTP_GET, .handler = ordenPienso,     .user_ctx = NULL },
   };
   for (auto& ruta : rutas) httpd_register_uri_handler(servidor, &ruta);
   httpd_register_err_handler(servidor, HTTPD_404_NOT_FOUND, paginaNoEncontrada);
@@ -1201,6 +1499,11 @@ void setup() {
 
   // Candado entre la web y loop() (ver candadoEstado)
   candadoEstado = xSemaphoreCreateMutex();
+
+  // Velocidad inicial (PULSO_US) en rpm, y secuencia automatica guardada
+  rpmActual = (int)(30000000UL / ((unsigned long)PULSO_US * PULSOS_POR_VUELTA));
+  ajustes.begin("motor", false);
+  leerAutomatico();
 
   // Temporizador que da los pulsos (se arranca en moverMotor)
   esp_timer_create_args_t argsTemporizador = {};

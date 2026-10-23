@@ -69,7 +69,7 @@
     responde una peticion (unos milisegundos) no salen pulsos, el motor se
     frena de golpe y se oye un "pum".
     Por eso los pulsos los da un temporizador del ESP32 (esp_timer) que salta
-    cada PULSO_US microsegundos, pase lo que pase con la web.
+    a intervalos fijos (segun la velocidad), pase lo que pase con la web.
 */
 
 #include <WiFi.h>
@@ -135,18 +135,11 @@
 // Con microstepping se multiplica: 1/2 = 400, 1/8 = 1600, 1/16 = 3200...
 #define PULSOS_POR_VUELTA   200
 
-// Tiempo en microsegundos que STEP esta en ALTO y despues en BAJO.
-// Un paso completo dura 2 x PULSO_US. Con 1000 us: 500 pasos por segundo,
-// es decir 2,5 vueltas por segundo con 200 pulsos por vuelta.
-// Menos tiempo = mas velocidad. Si el motor vibra sin girar o pierde pasos,
-// aumenta este valor.
-// Es la velocidad al arrancar: 1000 us con 200 pulsos por vuelta son 150 rpm.
-// Despues se cambia con el deslizador de velocidad de la web.
-#define PULSO_US            1000
-
-// Limites del deslizador de velocidad, en vueltas por minuto. Sin rampa de
+// Velocidad al encender, en vueltas por minuto. Despues se cambia con el
+// deslizador de velocidad de la web, entre RPM_MIN y RPM_MAX. Sin rampa de
 // aceleracion, a mucha velocidad el motor puede perder pasos: si pasa, baja
 // RPM_MAX.
+#define RPM_INICIAL         25
 #define RPM_MIN             10
 #define RPM_MAX             300
 
@@ -198,6 +191,8 @@
 // conexiones a la vez en su propia tarea, y cuando se llena cierra la menos
 // usada para dejar entrar a la nueva (lo que pasa al recargar la pagina).
 #define WEB_MAX_CONEXIONES  7       // conexiones abiertas a la vez como maximo
+#define WEB_ESPERA_S        2       // segundos maximos esperando a un navegador que
+                                    // no envia ni recibe (el sistema trae 5)
 
 // Depuracion por el Monitor Serie (115200 baudios): dispositivos que se
 // conectan a la red propia, conexion con el router y cada peticion a la web,
@@ -206,6 +201,11 @@
 // que no tapen lo demas).
 #define DEPURACION          true
 #define DEPURAR_ESTADO      false
+
+// Cada DIAGNOSTICO_MS, con DEPURACION, una linea [sistema] con las peticiones
+// atendidas, el envio mas lento, la memoria libre y los dispositivos
+// conectados a la red propia. Si la web se frena, esta linea dice por que.
+#define DIAGNOSTICO_MS      30000
 
 // =====================================================================
 
@@ -218,8 +218,8 @@
 #endif
 
 // El temporizador del ESP32 no admite periodos menores de 50 us.
-#if PULSO_US < 50
-#error "PULSO_US debe ser de 50 microsegundos o mas."
+#if RPM_INICIAL < RPM_MIN || RPM_INICIAL > RPM_MAX
+#error "RPM_INICIAL tiene que estar entre RPM_MIN y RPM_MAX."
 #endif
 
 httpd_handle_t servidor = NULL;
@@ -237,7 +237,8 @@ bool sentidoDerecha = true;           // sentido del movimiento en curso
 bool temporizadorEnMarcha = false;
 bool driverActivo = false;            // true = bobinas con corriente
 unsigned long finMovimiento = 0;      // instante (millis) en que paro el motor
-unsigned long pulsoUs = PULSO_US;     // periodo del temporizador: fija la velocidad
+unsigned long pulsoUs = 0;            // periodo del temporizador: fija la velocidad
+                                      // (lo calcula cambiarVelocidad en setup)
 int rpmActual = 0;                    // velocidad en vueltas por minuto (se calcula en setup)
 
 // Estado de cada rele (reles[0] es el rele 1 y reles[1] el rele 2)
@@ -370,6 +371,12 @@ String argumento(httpd_req_t* req, const char* nombre) {
   return String(valor);
 }
 
+// Contadores del diagnostico (ver DIAGNOSTICO_MS). Los escribe la tarea del
+// servidor web y los lee y pone a cero loop().
+volatile unsigned long webPeticiones = 0;     // respuestas enviadas
+volatile unsigned long webFallos = 0;         // respuestas que no se pudieron enviar
+volatile unsigned long webEnvioMaxMs = 0;     // envio mas lento, en ms
+
 // Envia la respuesta de la web y la anota: IP de quien pregunta, orden y
 // codigo de respuesta (con el texto, si es corto).
 esp_err_t responder(httpd_req_t* req, int codigo, const char* tipo, const String& cuerpo) {
@@ -380,7 +387,15 @@ esp_err_t responder(httpd_req_t* req, int codigo, const char* tipo, const String
   httpd_resp_set_status(req, estado);
   httpd_resp_set_type(req, tipo);
   httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+  unsigned long inicioEnvio = millis();
   esp_err_t resultado = httpd_resp_send(req, cuerpo.c_str(), cuerpo.length());
+  unsigned long msEnvio = millis() - inicioEnvio;
+  webPeticiones++;
+  if (resultado != ESP_OK) webFallos++;
+  if (msEnvio > webEnvioMaxMs) webEnvioMaxMs = msEnvio;
+  if (msEnvio >= 1000) {
+    aviso(String("[web] envio lento: ") + req->uri + " " + msEnvio + " ms a " + ipCliente(req));
+  }
 
   bool esEstado = (strncmp(req->uri, "/estado", 7) == 0);
   if (!DEPURACION || (esEstado && !DEPURAR_ESTADO && codigo == 200)) return resultado;
@@ -405,8 +420,8 @@ esp_err_t responder(httpd_req_t* req, int codigo, const char* tipo, const String
 //  MOTOR
 // ---------------------------------------------------------------------
 
-// Lo llama el temporizador cada PULSO_US microsegundos. Alterna STEP: un
-// pulso es ALTO durante PULSO_US y BAJO durante PULSO_US, y cuenta como dado
+// Lo llama el temporizador cada pulsoUs microsegundos. Alterna STEP: un
+// pulso es ALTO durante pulsoUs y BAJO durante pulsoUs, y cuenta como dado
 // al bajar STEP.
 void darPaso(void* arg) {
   portENTER_CRITICAL(&candadoMotor);
@@ -775,12 +790,20 @@ const char PAGINA[] PROGMEM = R"rawliteral(
   </div>
 
 <script>
+  // fetch que se rinde a los 'ms' milisegundos. Sin esto, una peticion que
+  // no llega se queda colgada y las siguientes esperan detras de ella.
+  function pedir(url, ms) {
+    var control = new AbortController();
+    var reloj = setTimeout(() => control.abort(), ms);
+    return fetch(url, { signal: control.signal }).finally(() => clearTimeout(reloj));
+  }
+
   // Envia una orden al ESP32 y muestra su respuesta
   function orden(url) {
-    fetch(url)
+    pedir(url, 5000)
       .then(r => r.text())
       .then(t => { document.getElementById('mensaje').textContent = t; })
-      .catch(() => { document.getElementById('mensaje').textContent = 'Sin conexión con el ESP32'; });
+      .catch(() => { document.getElementById('mensaje').textContent = 'Sin respuesta del ESP32'; });
   }
 
   var PPV = %PPV%;
@@ -821,7 +844,7 @@ const char PAGINA[] PROGMEM = R"rawliteral(
 
   // Orden de parar. Si no llega al ESP32, se reintenta hasta 'intentos' veces.
   function parar(intentos) {
-    fetch('/parar')
+    pedir('/parar', 2000)
       .then(r => r.text())
       .then(t => { document.getElementById('mensaje').textContent = t; })
       .catch(() => {
@@ -877,10 +900,23 @@ const char PAGINA[] PROGMEM = R"rawliteral(
     return encendido ? 'encendido, quedan ' + (ms / 1000).toFixed(1) + ' s' : 'apagado';
   }
 
-  // Consulta el estado del motor cada segundo
+  // Consulta el estado del motor cada segundo. La siguiente consulta sale un
+  // segundo DESPUES de que llegue (o se abandone) la anterior, nunca a la vez:
+  // el servidor del ESP32 atiende las peticiones de una en una y, si se
+  // acumulan, las ordenes de los botones esperan detras de todas ellas.
+  // Con la pagina oculta (otra pestana, pantalla apagada) no pregunta.
   var detecciones = null;
+  var siguienteEstado = null;
+  function programarEstado(ms) {
+    clearTimeout(siguienteEstado);
+    siguienteEstado = setTimeout(leerEstado, ms);
+  }
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) programarEstado(0); });
+  var estadoEnCurso = false;
   function leerEstado() {
-    fetch('/estado')
+    if (document.hidden || estadoEnCurso) return;
+    estadoEnCurso = true;
+    pedir('/estado', 3000)
       .then(r => r.json())
       .then(e => {
         document.getElementById('estado').textContent = e.moviendo
@@ -916,9 +952,9 @@ const char PAGINA[] PROGMEM = R"rawliteral(
           ? 'En serie: después se enciende el relé ' + e.serie_siguiente + ' (' + (e.serie_ms / 1000).toFixed(1) + ' s)<br>'
           : '';
       })
-      .catch(() => { document.getElementById('estado').textContent = 'sin conexión'; });
+      .catch(() => { document.getElementById('estado').textContent = 'sin conexión'; })
+      .finally(() => { estadoEnCurso = false; programarEstado(1000); });
   }
-  setInterval(leerEstado, 1000);
   leerEstado();
 </script>
 </body>
@@ -1218,7 +1254,7 @@ esp_err_t ordenPienso(httpd_req_t* req) {
 //                  "pulsos_por_vuelta":200,"con_corriente":true,
 //                  "rele":false,"rele_ms_restantes":0,"rele2":true,"rele2_ms_restantes":2500,
 //                  "serie_siguiente":1,"serie_ms":1500,"disparo":"girando","disparo_modo":"12",
-//                  "rpm":150,"auto_activo":true,"auto_modo":"21","pienso_detecciones":3}
+//                  "rpm":25,"auto_activo":true,"auto_modo":"21","pienso_detecciones":3}
 // ("rele" y "rele_ms_restantes" son los del rele 1, con los nombres de siempre;
 //  serie_siguiente es el rele que se enciende despues en una serie, 0 si no hay;
 //  disparo es "girando" (avance), "retrocediendo", "esperando" o "" si no hay
@@ -1298,6 +1334,19 @@ void arrancarServidorWeb() {
   config.lru_purge_enable = true;   // si se llena, cierra la conexion menos usada
   config.stack_size = 8192;         // margen para construir la pagina y los textos
   config.max_uri_handlers = 12;     // por defecto solo admite 8 direcciones
+
+  // El servidor atiende las peticiones de una en una. Si un movil deja una
+  // conexion a medias (pantalla apagada, cambio a datos moviles...), el
+  // servidor espera en ella hasta recv/send_wait_timeout antes de seguir, y
+  // mientras tanto no atiende a nadie. Con los 5 s por defecto, unas pocas
+  // conexiones asi frenaban la web hasta 20 s. Se baja a WEB_ESPERA_S, y el
+  // keep-alive de TCP cierra las conexiones cuyo movil ya no contesta.
+  config.recv_wait_timeout = WEB_ESPERA_S;
+  config.send_wait_timeout = WEB_ESPERA_S;
+  config.keep_alive_enable = true;
+  config.keep_alive_idle = 5;       // segundos sin trafico antes de comprobar
+  config.keep_alive_interval = 2;   // segundos entre comprobaciones
+  config.keep_alive_count = 3;      // comprobaciones sin respuesta para cerrarla
 
   if (httpd_start(&servidor, &config) != ESP_OK) {
     aviso("[web] ERROR: no se pudo arrancar el servidor web");
@@ -1444,6 +1493,35 @@ void cambiarModoWifi() {
   }
 }
 
+// Se llama en loop(): cada DIAGNOSTICO_MS escribe la linea [sistema] y pone a
+// cero los contadores de la web.
+void diagnostico() {
+  static unsigned long ultimo = 0;
+  if (!DEPURACION || millis() - ultimo < DIAGNOSTICO_MS) return;
+  ultimo = millis();
+  unsigned long peticiones = webPeticiones, fallos = webFallos, envioMax = webEnvioMaxMs;
+  webPeticiones = 0;
+  webFallos = 0;
+  webEnvioMaxMs = 0;
+  String linea = "[sistema] ";
+  linea += DIAGNOSTICO_MS / 1000;
+  linea += " s: ";
+  linea += peticiones;
+  linea += " peticiones, ";
+  linea += fallos;
+  linea += " sin enviar, envio mas lento ";
+  linea += envioMax;
+  linea += " ms | memoria libre ";
+  linea += ESP.getFreeHeap();
+  linea += " B, minima ";
+  linea += ESP.getMinFreeHeap();
+  linea += " B, bloque mayor ";
+  linea += ESP.getMaxAllocHeap();
+  linea += " B | en la red propia: ";
+  linea += WiFi.softAPgetStationNum();
+  aviso(linea);
+}
+
 // Se llama en loop(): detecta la pulsacion corta de BOOT, con antirrebote.
 // No hace caso hasta pasados ARRANQUE_GRACIA_MS y haber visto el boton suelto.
 void leerBoot() {
@@ -1500,8 +1578,8 @@ void setup() {
   // Candado entre la web y loop() (ver candadoEstado)
   candadoEstado = xSemaphoreCreateMutex();
 
-  // Velocidad inicial (PULSO_US) en rpm, y secuencia automatica guardada
-  rpmActual = (int)(30000000UL / ((unsigned long)PULSO_US * PULSOS_POR_VUELTA));
+  // Velocidad inicial y secuencia automatica guardada
+  cambiarVelocidad(RPM_INICIAL);
   ajustes.begin("motor", false);
   leerAutomatico();
 
@@ -1540,5 +1618,6 @@ void loop() {
   leerBoot();                 // pulsacion de BOOT: cambia entre modo AP y host
   actualizarWifi();           // sigue la busqueda de red en modo host
   actualizarLed();            // parpadeo en AP, doble de rapido buscando, fijo conectado
+  diagnostico();              // cada DIAGNOSTICO_MS, la linea [sistema] por el Monitor Serie
   delay(1);                   // cede el procesador a las demas tareas (web, WiFi)
 }

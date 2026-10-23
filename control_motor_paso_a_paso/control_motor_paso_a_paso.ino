@@ -113,7 +113,7 @@
 // tiempo indicado y luego se apaga solo. La activacion en serie enciende uno
 // y, cuando se apaga, el otro, cada uno con su tiempo.
 #define RELE1_PIN           27      // GPIO conectado a la entrada IN1 del modulo de reles (D27)
-#define RELE2_PIN           26      // GPIO conectado a la entrada IN2 del modulo de reles (D26)
+#define RELE2_PIN           13      // GPIO conectado a la entrada IN2 del modulo de reles (D13)
                                     // No usar GPIO 14 ni 15: dan pulsos durante el arranque
                                     // del ESP32 y el rele chasquearia al encender
 #define RELE_ACTIVO         HIGH    // nivel que enciende los reles. Muchos modulos con

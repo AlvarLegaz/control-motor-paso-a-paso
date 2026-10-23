@@ -1,97 +1,74 @@
 # Control motor paso a paso
 
-Programa para ESP32 con Arduino IDE que controla un motor paso a paso y dos relés desde una página web, y los combina en un disparo: un giro, una espera y los relés. Al encender, el ESP32 crea su propia red WiFi, ESP32_MOTOR; con una pulsación del botón BOOT pasa a conectarse a la WiFi de casa. Funciona con cualquier driver de entradas STEP y DIR: A4988, DRV8825, TMC2208, TB6600, DM542 y similares.
+Programa para ESP32 (Arduino IDE) que controla un motor paso a paso y dos relés desde una página web. El ESP32 crea su propia red WiFi o se conecta a la de casa, y la página se abre desde el móvil o el PC sin instalar nada.
 
-El montaje probado usa un ESP32 WROOM-32, un driver Pololu DRV8825 y un motor 17HS19-2004S1. Sus hojas de datos y el detalle de todas las conexiones, el ajuste de corriente y el microstepping están en [docu/readme.txt](docu/readme.txt).
+Funciona con cualquier driver de entradas STEP y DIR: A4988, DRV8825, TMC2208, TB6600, DM542 y similares.
+
+## Funciones
+
+- Giro del motor con velocidad regulable (10 a 300 rpm) y ángulos de avance y de retroceso de 0 a 360 grados.
+- Dos relés temporizados, por separado o en serie: uno durante su tiempo y, al apagarse, el otro.
+- Disparo: avance, retroceso, espera y encendido de los relés en una sola orden.
+- Secuencia automática al detectar pienso. El sensor aún no está conectado: la página permite elegir la secuencia y simular la detección.
+- Red propia (modo AP) o WiFi de casa (modo host), con cambio de modo en el botón BOOT de la placa.
+- Órdenes HTTP sencillas para controlarlo también desde otro programa.
+- Mensajes de depuración y diagnóstico por el Monitor Serie.
+
+## Material
+
+| Componente | Modelo usado |
+|---|---|
+| Placa | ESP32 WROOM-32 (ESP32 Dev Module) |
+| Driver | Pololu DRV8825 |
+| Motor | 17HS19-2004S1, 200 pasos por vuelta |
+| Relés | Módulo de dos relés |
+
+La carpeta [docu](docu) tiene las hojas de datos y, en [docu/readme.txt](docu/readme.txt), el cableado completo, el ajuste de corriente del driver y el microstepping.
 
 ## Conexiones
 
-| ESP32 WROOM | Driver | En drivers optoacoplados, tipo TB6600 |
+**Driver del motor:**
+
+| ESP32 | Driver | En drivers optoacoplados (TB6600) |
 |---|---|---|
 | GPIO 33 (D33) | STEP | PUL+ |
 | GPIO 32 (D32) | DIR | DIR+ |
 | GPIO 25 (D25) | EN | ENA+ |
 | GND | GND lógico | PUL-, DIR- y ENA- |
 
-Conexiones de los relés:
+**Módulo de relés:**
 
-| Dispositivo | Pin ESP32 | Pin del módulo | Descripción |
-|---|---|---|---|
-| Relé 1 | GPIO 27 (D27) | IN1 | Control del primer relé |
-| Relé 2 | GPIO 13 (D13) | IN2 | Control del segundo relé |
-| Alimentación | VIN (5 V) o 3V3 | VCC | Según las especificaciones del módulo |
-| Masa | GND | GND | Masa común |
-
-El relé 1 va a GPIO 27 (D27) y el relé 2 a GPIO 13 (D13), en las entradas IN1 e IN2 del módulo, con GND común y VCC a 5 V (VIN) o 3,3 V según el módulo. Los detalles están en [docu/readme.txt](docu/readme.txt).
-
-En la placa de desarrollo, D33 y D32 están justo al lado de D35 y D34. Los pines D34, D35, D36 (VP) y D39 (VN) no sirven para el driver: en el ESP32 son solo de entrada. El programa no compila si se ponen en `STEP_PIN` o `DIR_PIN`.
-
-- El ESP32 da señales de 3,3 V. A4988, DRV8825 y TMC2208 las aceptan directamente. Algunos drivers optoacoplados necesitan 5 V: si el motor no responde, revisa la hoja del driver.
-- Si el driver tiene entrada ENABLE, déjala habilitada. En el A4988 y el DRV8825 lo está por defecto si no se conecta.
-- La alimentación del motor va al driver, nunca al ESP32. Une las masas del ESP32 y del driver.
-
-Los pines se cambian en `STEP_PIN` y `DIR_PIN`, al principio del programa.
-
-## Parámetros
-
-Todos están al principio de `control_motor_paso_a_paso.ino`:
-
-| Parámetro | Valor inicial | Qué hace |
+| ESP32 | Módulo | Función |
 |---|---|---|
-| `STEP_PIN` | 33 | GPIO conectado a STEP |
-| `DIR_PIN` | 32 | GPIO conectado a DIR |
-| `ENABLE_PIN` | 25 | GPIO conectado a EN, para cortar la corriente del motor en reposo |
-| `ENABLE_ACTIVO` | LOW | Nivel de EN que activa el driver. LOW en DRV8825 y A4988 |
-| `DESACTIVAR_EN_REPOSO` | true | Corta la corriente del motor cuando lleva `REPOSO_MS` parado. Pon `false` si una carga puede mover el eje en reposo |
-| `REPOSO_MS` | 500 | Tiempo parado antes de cortar la corriente |
-| `RELE1_PIN` | 27 | GPIO conectado a la entrada IN1 del módulo: el relé 1. Evita GPIO 14 y 15, que dan pulsos durante el arranque |
-| `RELE2_PIN` | 13 | GPIO conectado a la entrada IN2 del módulo: el relé 2 |
-| `RELE_ACTIVO` | HIGH | Nivel que enciende los relés. Muchos módulos con optoacoplador usan LOW |
-| `RELE_TIEMPO_S` | 1 | Tiempo por defecto de cada relé en la web, en segundos |
-| `RELE_MAX_S` | 600 | Tiempo máximo de cada relé por orden |
-| `DISPARO_ESPERA_MS` | 1000 | Espera del disparo entre el final del giro y el encendido de los relés |
-| `ENABLE_ESPERA_MS` | 5 | Espera tras dar corriente antes del primer paso |
-| `PULSOS_POR_VUELTA` | 200 | Pulsos para una vuelta. Con microstepping se multiplica: 1/8 son 1600, 1/16 son 3200 |
-| `PULSO_US` | 1000 | Microsegundos de STEP en alto y luego en bajo. Un paso dura el doble. Es la velocidad al encender: 150 rpm a 200 pulsos por vuelta |
-| `RPM_MIN` / `RPM_MAX` | 10 / 300 | Límites del deslizador de velocidad, en vueltas por minuto. Sin rampa de aceleración, si pierde pasos a mucha velocidad, baja `RPM_MAX` |
-| `LED_PIN` | 2 | LED de estado de la WiFi, el azul de la placa |
-| `LED_AP_MS` | 500 | Medio periodo del parpadeo en modo AP. Buscando red parpadea el doble de rápido |
-| `BOTON_MODO_PIN` | 0 | Botón que cambia de modo: el BOOT de la placa |
-| `ARRANQUE_GRACIA_MS` | 3000 | Tiempo tras encender en el que BOOT no hace nada |
-| `ANTIRREBOTE_MS` | 50 | Filtro de rebotes del botón |
-| `TIEMPO_CONEXION_MS` | 15000 | Tiempo máximo intentando conectar a cada red en modo host |
-| `NOMBRE_RED` | motor | En modo host, la web se abre también en `http://motor.local` |
-| `WIFI_SSID` | ESP32_MOTOR | Nombre de la red propia del modo AP |
-| `WIFI_PASSWORD` | 12345678 | Clave de la red propia, de 8 caracteres como mínimo |
-| `WIFI_CANAL` | 6 | Canal de la red propia |
-| `WIFI_POTENCIA` | 8,5 dBm | Potencia de la red propia. Baja porque en placas clónicas la red no aparecía a potencia máxima |
-| `DIR_DERECHA` | HIGH | Nivel de DIR para girar a la derecha. Cámbialo a LOW si gira al revés |
-| `DIR_SETUP_US` | 5 | Espera entre cambiar DIR y el primer pulso |
-| `VUELTAS_MAX` | 1000 | Máximo de vueltas por orden |
-| `WEB_MAX_CONEXIONES` | 7 | Conexiones a la web abiertas a la vez. Si se llenan, el servidor cierra la menos usada |
-| `DEPURACION` | true | Muestra en el Monitor Serie quién se conecta, el estado del router y cada petición a la web |
-| `DEPURAR_ESTADO` | false | Muestra también las consultas `/estado` que la página hace cada segundo |
+| GPIO 27 (D27) | IN1 | Relé 1 |
+| GPIO 13 (D13) | IN2 | Relé 2 |
+| VIN (5 V) o 3V3 | VCC | Según la tensión del módulo |
+| GND | GND | Masa común |
 
-Con `PULSO_US` a 1000 el motor da 500 pasos por segundo, que son 2,5 vueltas por segundo a 200 pulsos por vuelta. Si vibra sin girar o pierde pasos, sube `PULSO_US`.
+- El ESP32 da señales de 3,3 V. A4988, DRV8825 y TMC2208 las aceptan directamente; algunos drivers optoacoplados necesitan 5 V.
+- La alimentación del motor va al driver, nunca al ESP32. Las masas del ESP32 y del driver van unidas.
+- Los GPIO 34, 35, 36 (VP) y 39 (VN) son solo de entrada y no sirven como salidas: el programa no compila si se ponen en un pin de salida.
+- Los relés no deben ir en GPIO 14 ni 15, que dan pulsos durante el arranque del ESP32.
 
-## Cargar el programa
+## Instalación
 
-1. En Arduino IDE, instala el soporte de ESP32: menú Herramientas, Placa, Gestor de placas, busca "esp32" de Espressif Systems e instálalo. Si no aparece, añade esta dirección en Archivo, Preferencias, "Gestor de URLs adicionales de tarjetas":
+1. En Arduino IDE, instala el soporte de ESP32 de Espressif Systems desde el Gestor de placas. Si no aparece, añade esta dirección en Archivo, Preferencias, "Gestor de URLs adicionales de tarjetas":
 
    ```
    https://espressif.github.io/arduino-esp32/package_esp32_index.json
    ```
 
-2. En la carpeta `control_motor_paso_a_paso`, copia `credenciales.h.ejemplo` como `credenciales.h` y pon el nombre y la clave de tus WiFi: la primera red que se prueba y, opcionalmente, una segunda. El ESP32 solo usa redes de 2,4 GHz. `credenciales.h` está en `.gitignore` y no se sube al repositorio.
-3. Abre `control_motor_paso_a_paso/control_motor_paso_a_paso.ino`.
-4. Elige la placa "ESP32 Dev Module" y el puerto del ESP32.
-5. Pulsa Subir. Si sale "Wrong boot mode", mantén pulsado BOOT, pulsa y suelta EN, y sigue con BOOT pulsado hasta que salga "Writing at".
+2. En la carpeta `control_motor_paso_a_paso`, copia `credenciales.h.ejemplo` como `credenciales.h` y escribe el nombre y la clave de tu WiFi, y opcionalmente de una segunda red. El ESP32 solo usa redes de 2,4 GHz. `credenciales.h` está en `.gitignore` y no se sube al repositorio.
+3. Abre `control_motor_paso_a_paso/control_motor_paso_a_paso.ino`, elige la placa "ESP32 Dev Module" y el puerto del ESP32.
+4. Pulsa Subir. Si sale "Wrong boot mode", mantén pulsado BOOT, pulsa y suelta EN, y sigue con BOOT pulsado hasta que salga "Writing at".
 
-No hace falta instalar ninguna librería: `WiFi.h`, `ESPmDNS.h` y el servidor web `esp_http_server.h` vienen con el soporte de ESP32.
+No hace falta instalar librerías: todo lo que usa el programa viene con el soporte de ESP32.
 
-## Manual de uso: modos WiFi
+## Uso
 
-El ESP32 tiene dos modos de red. Se cambia de uno a otro con una pulsación corta del botón **BOOT** de la placa, y el **LED azul** indica en cuál está.
+### Modos WiFi
+
+El ESP32 tiene dos modos de red. Una pulsación corta del botón **BOOT** cambia de uno a otro y el **LED azul** indica en cuál está.
 
 ```mermaid
 stateDiagram-v2
@@ -113,155 +90,204 @@ stateDiagram-v2
     HOST --> AP: Pulsar BOOT
 ```
 
-**Qué ves y qué puedes hacer:**
-
-| LED | Modo | Para entrar en la web | Si pulsas BOOT |
+| LED | Modo | Para abrir la página | Al pulsar BOOT |
 |---|---|---|---|
-| Parpadeando | AP: red propia | Conecta el móvil a `ESP32_MOTOR`, clave `12345678`, y abre `http://192.168.4.1` | Pasa a buscar tu WiFi |
-| Parpadeando el doble de rápido | Buscando tu WiFi | No hay web mientras busca | Cancela y vuelve al modo AP |
-| Fijo | Host: conectado a tu WiFi | Con el móvil en tu WiFi, abre `http://motor.local` o la IP que sale en el Monitor Serie | Vuelve al modo AP |
+| Parpadeando | AP: red propia | Conecta el móvil a `ESP32_MOTOR` (clave `12345678`) y abre `http://192.168.4.1` | Busca tu WiFi |
+| Parpadeando el doble de rápido | Buscando tu WiFi | No hay página mientras busca | Vuelve al modo AP |
+| Fijo | Host: conectado a tu WiFi | Desde la misma WiFi, abre `http://motor.local` o la IP que sale en el Monitor Serie | Vuelve al modo AP |
 
-**Paso a paso para usar la WiFi de casa:**
+- El ESP32 siempre arranca en modo AP. Durante los 3 primeros segundos BOOT no hace nada, para que no cuente si seguía pulsado al encender o al cargar el programa.
+- Si no conecta a ninguna red, vuelve solo al modo AP.
+- Si en modo host se cae la WiFi, el LED parpadea rápido mientras reconecta solo.
+- **Cada cambio de modo para el motor, cancela el disparo y apaga los relés,** porque se pierde la conexión con la página.
 
-1. Enciende el ESP32 y espera a que el LED parpadee. Está en modo AP.
-2. Espera al menos **3 segundos** desde que lo encendiste. Antes, BOOT no hace nada, para que no cuente si seguía pulsado al encender o al cargar el programa.
-3. Da una **pulsación corta a BOOT**. El LED parpadea el doble de rápido mientras busca.
-4. Si conecta, el LED se queda **fijo**. Abre `http://motor.local` desde un móvil o PC en la misma WiFi.
-5. Si no encuentra ninguna red en unos 30 segundos, vuelve solo al modo AP y el LED parpadea de nuevo.
+### Página de control
 
-**Importante:**
-- **Cada cambio de modo para el motor, cancela el disparo, apaga los dos relés y cancela la activación en serie,** porque en ese momento se pierde la conexión con la página y no podrías pararlos.
-- **Si en modo host se cae la WiFi,** el LED vuelve a parpadear rápido mientras el ESP32 reconecta solo. Al recuperar la red se queda fijo de nuevo.
-- **Las redes y sus claves** están en `credenciales.h`, en el orden en que se prueban.
-- **El Monitor Serie,** a 115200 baudios, va contando cada paso: modo, redes probadas e IP.
+**Motor.** Tres deslizadores y los botones **Avanzar**, **Retroceder** y **Parar**:
 
-## Depuración por el Monitor Serie
+| Deslizador | Qué hace |
+|---|---|
+| Velocidad | De 10 a 300 rpm (`RPM_MIN` y `RPM_MAX`). Se aplica al soltarlo, también al giro en curso. Al encender el ESP32 vuelve a 25 rpm (`RPM_INICIAL`) |
+| Ángulo de avance | De 0 a 360 grados: lo que gira **Avanzar**, a la derecha |
+| Ángulo de retroceso | De 0 a 360 grados: lo que gira **Retroceder**, a la izquierda |
 
-Abre el Monitor Serie del Arduino IDE a **115200 baudios**. Cada línea lleva delante los segundos desde el arranque, y una etiqueta según de qué trata:
+Junto a cada ángulo se ven los pasos equivalentes. Con 200 pulsos por vuelta, cada paso son 1,8 grados. El navegador recuerda los ángulos. Mientras el motor gira, las órdenes de mover se rechazan hasta que termina o se pulsa Parar.
+
+**Relés.** Cada relé tiene su tiempo en segundos (1 s por defecto, 600 s como máximo):
+
+| Botón | Qué hace |
+|---|---|
+| Activar relé 1 / Activar relé 2 | Enciende ese relé durante su tiempo y se apaga solo |
+| Relé 1 y luego relé 2 | Enciende el relé 1 y, al apagarse, el relé 2, cada uno con su tiempo |
+| Relé 2 y luego relé 1 | Lo mismo en el orden contrario |
+
+En una serie, el segundo relé espera apagado su turno. Una orden suelta a cualquier relé cancela la serie pendiente, y una serie nueva sustituye a la anterior.
+
+**Disparo.** El botón **Realizar disparo** hace en orden:
+
+1. Avanza el ángulo de avance.
+2. Retrocede el ángulo de retroceso; con 0 grados no retrocede.
+3. Espera 1 segundo (`DISPARO_ESPERA_MS`).
+4. Enciende los relés según la opción elegida: relé 1, relé 2, 1 y luego 2, o 2 y luego 1.
+
+Parar, una orden de girar o un cambio de modo cancelan el disparo mientras gira o espera. Si los relés ya se han encendido, siguen hasta acabar su tiempo.
+
+**Sensor de pienso (maqueta).** El sensor aún no está implementado. El bloque morado tiene:
+
+- La casilla **Disparo automático al detectar pienso**, que activa o desactiva la secuencia.
+- La secuencia que se lanzará: relé 1, relé 2, 1 y luego 2, o 2 y luego 1, con los tiempos de los relés.
+- El botón **Simular detección**, que actúa como si el sensor hubiera visto pienso. El piloto se pone verde 2 segundos en cada detección.
+
+La selección se guarda en la memoria del ESP32 al cambiarla y se conserva al apagarlo. Para conectar el sensor real, basta con leerlo en `loop()` y llamar a `piensoDetectado()` al detectar pienso.
+
+**Estado.** El último bloque muestra si el motor gira o está parado, con o sin corriente, la fase del disparo, el tiempo que le queda a cada relé y, durante una serie, qué relé va después.
+
+## Configuración
+
+Todos los parámetros están al principio de `control_motor_paso_a_paso.ino`:
+
+| Parámetro | Valor | Qué hace |
+|---|---|---|
+| `STEP_PIN` | 33 | GPIO conectado a STEP |
+| `DIR_PIN` | 32 | GPIO conectado a DIR |
+| `ENABLE_PIN` | 25 | GPIO conectado a EN, para cortar la corriente del motor en reposo |
+| `ENABLE_ACTIVO` | LOW | Nivel de EN que activa el driver. LOW en DRV8825 y A4988 |
+| `DESACTIVAR_EN_REPOSO` | true | Corta la corriente del motor cuando lleva `REPOSO_MS` parado. Pon `false` si una carga puede mover el eje en reposo |
+| `REPOSO_MS` | 500 | Tiempo parado antes de cortar la corriente |
+| `ENABLE_ESPERA_MS` | 5 | Espera tras dar corriente antes del primer paso |
+| `RELE1_PIN` | 27 | GPIO del relé 1 |
+| `RELE2_PIN` | 13 | GPIO del relé 2 |
+| `RELE_ACTIVO` | HIGH | Nivel que enciende los relés. Muchos módulos con optoacoplador usan LOW |
+| `RELE_TIEMPO_S` | 1 | Tiempo por defecto de cada relé en la página, en segundos |
+| `RELE_MAX_S` | 600 | Tiempo máximo de cada relé por orden |
+| `DISPARO_ESPERA_MS` | 1000 | Espera del disparo entre el final del giro y el encendido de los relés |
+| `PULSOS_POR_VUELTA` | 200 | Pulsos para una vuelta. Con microstepping se multiplica: 1/8 son 1600, 1/16 son 3200 |
+| `RPM_INICIAL` | 25 | Velocidad al encender, en vueltas por minuto |
+| `RPM_MIN` / `RPM_MAX` | 10 / 300 | Límites del deslizador de velocidad. No hay rampa de aceleración: si el motor pierde pasos, baja `RPM_MAX` |
+| `DIR_DERECHA` | HIGH | Nivel de DIR para girar a la derecha. Cámbialo a LOW si gira al revés |
+| `DIR_SETUP_US` | 5 | Espera entre cambiar DIR y el primer pulso |
+| `VUELTAS_MAX` | 1000 | Máximo de vueltas por orden HTTP |
+| `LED_PIN` | 2 | LED de estado de la WiFi, el azul de la placa |
+| `LED_AP_MS` | 500 | Medio periodo del parpadeo en modo AP |
+| `BOTON_MODO_PIN` | 0 | Botón que cambia de modo: el BOOT de la placa |
+| `ARRANQUE_GRACIA_MS` | 3000 | Tiempo tras encender en el que BOOT no hace nada |
+| `ANTIRREBOTE_MS` | 50 | Filtro de rebotes del botón |
+| `TIEMPO_CONEXION_MS` | 15000 | Tiempo máximo intentando conectar a cada red en modo host |
+| `NOMBRE_RED` | motor | En modo host, la página se abre también en `http://motor.local` |
+| `WIFI_SSID` | ESP32_MOTOR | Nombre de la red propia |
+| `WIFI_PASSWORD` | 12345678 | Clave de la red propia, de 8 caracteres como mínimo |
+| `WIFI_CANAL` | 6 | Canal de la red propia |
+| `WIFI_POTENCIA` | 8,5 dBm | Potencia de la red propia. En placas clónicas la red no aparece a potencia máxima |
+| `WEB_MAX_CONEXIONES` | 7 | Conexiones a la página abiertas a la vez. Si se llenan, se cierra la menos usada |
+| `WEB_ESPERA_S` | 2 | Segundos máximos que el servidor espera a un navegador que no envía ni recibe |
+| `DEPURACION` | true | Mensajes de depuración por el Monitor Serie |
+| `DEPURAR_ESTADO` | false | Muestra también las consultas `/estado` de cada segundo |
+| `DIAGNOSTICO_MS` | 30000 | Cada cuánto sale la línea de diagnóstico `[sistema]` |
+
+## Órdenes HTTP
+
+La página usa estas direcciones, que también se pueden llamar desde otro programa. Todas son `GET` y responden con un texto, salvo `/` (la página) y `/estado` (JSON).
+
+| Dirección | Qué hace |
+|---|---|
+| `/` | Página de control |
+| `/mover?vueltas=0.25&sentido=der` | Gira 0,25 vueltas. `sentido` es `der` o `izq` |
+| `/parar` | Para el motor y cancela el disparo pendiente |
+| `/velocidad?rpm=120` | Cambia la velocidad, de `RPM_MIN` a `RPM_MAX` |
+| `/rele?n=1&segundos=1` | Enciende el relé `n` (1 o 2) durante ese tiempo |
+| `/serie?orden=12&segundos1=1&segundos2=3` | Relés en serie: `12` es primero el 1 y luego el 2; `21`, al revés. `segundos1` es siempre el tiempo del relé 1 |
+| `/disparo?vueltas=0.25&sentido=der&retroceso=0.125&modo=12&segundos1=1&segundos2=3` | Disparo: gira `vueltas`, retrocede `retroceso` (opcional), espera `DISPARO_ESPERA_MS` y enciende los relés según `modo`: `1`, `2`, `12` o `21` |
+| `/automatico?activo=1&modo=21&segundos1=1&segundos2=3` | Guarda la secuencia automática del sensor de pienso: activada (`1`) o no (`0`), modo y tiempos |
+| `/pienso` | Simula una detección de pienso |
+| `/estado` | Estado en JSON (ver abajo) |
+
+Campos de `/estado`:
+
+| Campo | Contenido |
+|---|---|
+| `moviendo`, `pulsos_pendientes`, `sentido` | Si el motor gira, cuántos pulsos le faltan y hacia dónde |
+| `pulsos_por_vuelta`, `rpm`, `con_corriente` | Configuración del motor, velocidad actual y si las bobinas tienen corriente |
+| `rele`, `rele_ms_restantes` | Relé 1: encendido o no y milisegundos que le quedan |
+| `rele2`, `rele2_ms_restantes` | Lo mismo para el relé 2 |
+| `serie_siguiente`, `serie_ms` | En una serie, relé que se enciende después y su tiempo (0 si no hay serie) |
+| `disparo`, `disparo_modo` | Fase del disparo (`girando`, `retrocediendo`, `esperando` o vacío) y su modo |
+| `auto_activo`, `auto_modo` | Secuencia automática del sensor de pienso |
+| `pienso_detecciones` | Detecciones de pienso desde el arranque |
+
+## Monitor Serie y diagnóstico
+
+El Monitor Serie, a **115200 baudios**, muestra cada mensaje con los segundos desde el arranque y una etiqueta:
 
 | Etiqueta | Qué avisa |
 |---|---|
-| `[wifi]` | Cambios de modo, redes probadas, dispositivos que se conectan o desconectan de ESP32_MOTOR con su MAC e IP, y conexión o caída del router con el motivo |
-| `[web]` | Cada petición a la página: IP de quien la hace, orden con sus parámetros, código de respuesta y texto. También las conexiones vacías que se cierran |
+| `[wifi]` | Cambios de modo, redes probadas, dispositivos que entran o salen de la red propia y caídas del router con su motivo |
+| `[web]` | Cada petición: IP, orden, código de respuesta y texto. También los envíos que tardan un segundo o más |
 | `[motor]` | Fin de movimiento y corte de corriente en reposo |
-| `[rele]` | Apagado de cada relé y, en una activación en serie, el encendido del segundo |
-| `[disparo]` | Fin del giro del disparo, encendido de los relés y disparos cancelados |
+| `[rele]` | Apagado de cada relé y paso al segundo en una serie |
+| `[disparo]` | Fases del disparo y disparos cancelados |
+| `[pienso]` | Detecciones de pienso y si se lanza la secuencia automática |
 | `[boton]` | Pulsación de BOOT |
+| `[sistema]` | Cada 30 s: peticiones atendidas, respuestas no enviadas, envío más lento, memoria libre, mínima y bloque mayor, y dispositivos en la red propia |
 
-Ejemplo de una sesión en modo AP:
+Ejemplo en modo AP:
 
 ```
 [     0.812] [wifi] modo AP: red ESP32_MOTOR (clave 12345678), web en http://192.168.4.1
-[     0.812] [wifi] pulsa BOOT para pasar a modo host
 [    14.203] [wifi] AP: se conecta un dispositivo, MAC 4A:E5:B5:64:03:42 (conectados: 1)
 [    14.951] [wifi] AP: IP asignada 192.168.4.2
 [    17.330] [web] 192.168.4.2 GET / -> 200
-[    21.004] [web] 192.168.4.2 GET /mover?vueltas=2&sentido=der -> 200 Girando 2.00 vueltas a la derecha (400 pulsos)
-[    22.118] [web] 192.168.4.2 GET /parar -> 200 Motor parado.
+[    21.004] [web] 192.168.4.2 GET /mover?vueltas=0.2500&sentido=der -> 200 Avanzando 90° a la derecha (50 pulsos)
 [    22.618] [motor] en reposo: sin corriente
 ```
 
-Las consultas `/estado` de cada segundo no salen, salvo que pongas `DEPURAR_ESTADO` a `true`. Para quitar toda la depuración, pon `DEPURACION` a `false`; los avisos de cambio de modo y de red siguen saliendo.
+Las consultas `/estado` no salen salvo con `DEPURAR_ESTADO` a `true`. Con `DEPURACION` a `false` solo salen los avisos de modo y de red.
 
-**Motivos de desconexión del router más habituales,** que salen como `motivo N (NOMBRE)`:
+### Problemas frecuentes
 
-| Motivo | Qué suele significar |
+| Síntoma | Causa probable |
+|---|---|
+| La página tarda en responder | Mala señal o un móvil con la conexión a medias. Lo indican `[web] envio lento` y el envío más lento de la línea `[sistema]` |
+| La memoria libre de `[sistema]` baja y no se recupera | Pérdida de memoria en el programa |
+| El motor vibra sin girar o pierde pasos | Velocidad demasiado alta o corriente del driver mal ajustada. Baja la velocidad o `RPM_MAX` |
+| Gira al revés | Cambia `DIR_DERECHA` a LOW |
+| Un relé se enciende al arrancar y se apaga al pulsar | El módulo se activa con LOW: cambia `RELE_ACTIVO` |
+| No conecta a la WiFi de casa | Mira el motivo en el Monitor Serie (tabla de abajo) |
+
+| Motivo de desconexión | Qué suele significar |
 |---|---|
 | 201 `NO_AP_FOUND` | No encuentra la red: nombre mal escrito, red de 5 GHz o fuera de alcance |
 | 15 `4WAY_HANDSHAKE_TIMEOUT` o 204 `HANDSHAKE_TIMEOUT` | Casi siempre, clave incorrecta |
 | 202 `AUTH_FAIL` | El router rechaza la autenticación |
 | 8 `ASSOC_LEAVE` | Desconexión pedida por el propio ESP32, por ejemplo al cambiar de modo |
 
-## Uso de la página
+## Funcionamiento interno
 
-La página muestra los pulsos por vuelta y tres deslizadores:
+El programa reparte el trabajo en tres partes que no se bloquean entre sí:
 
-| Deslizador | Qué hace |
-|---|---|
-| **Velocidad** | De `RPM_MIN` a `RPM_MAX` vueltas por minuto. Se envía al soltarlo y cambia también el giro en curso. Se mantiene al recargar la página, no al apagar el ESP32 |
-| **Ángulo de avance** | De 0 a 360 grados. Lo que gira el botón **Avanzar**, a la derecha |
-| **Ángulo de retroceso** | De 0 a 360 grados. Lo que gira el botón **Retroceder**, a la izquierda |
+- **Pulsos del motor.** `moverMotor()` fija DIR, apunta cuántos pulsos hay que dar y arranca un temporizador del ESP32 (`esp_timer`). El temporizador alterna la salida STEP en `darPaso()` a intervalos fijos, medio periodo de paso según la velocidad (6 ms a 25 rpm con 200 pulsos por vuelta), pase lo que pase con la web, así que el giro no se frena mientras se atiende una petición y el número de pulsos es exacto. El intervalo mínimo del temporizador es de 50 µs.
+- **Servidor web.** Usa `esp_http_server`, el servidor del sistema del ESP32, en su propia tarea. Mantiene varias conexiones abiertas, pero atiende las peticiones de una en una. Por eso:
+  - El servidor deja de esperar a un navegador que no responde a los `WEB_ESPERA_S` segundos.
+  - El keep-alive de TCP cierra las conexiones de móviles que ya no contestan.
+  - La página pide el estado un segundo después de recibir la respuesta anterior y deja de pedirlo mientras está oculta.
+  - Las peticiones de la página se abandonan si no contestan: el estado a los 3 s, las órdenes a los 5 s y Parar a los 2 s, que se reintenta hasta 5 veces.
+- **Bucle principal.** `loop()` detecta el fin de cada giro, sigue las fases del disparo, apaga los relés y lanza el segundo de una serie, y atiende el botón BOOT, la búsqueda de red, el LED y el diagnóstico.
 
-Junto a cada ángulo aparecen los pasos que son: el ángulo entre 360 por `PULSOS_POR_VUELTA`, redondeado al paso más cercano. Con 200 pulsos por vuelta, cada paso son 1,8 grados y 90 grados son 50 pasos. El navegador recuerda los dos ángulos. Debajo está el botón **Parar**. La línea de estado muestra si el motor está girando y cuántos pulsos le quedan.
+La web y el bucle principal comparten el estado del motor y de los relés con un candado (`candadoEstado`). Cada orden lo toma solo mientras cambia el estado y lo suelta antes de enviar la respuesta, para que un envío lento no frene el bucle.
 
-Mientras el motor gira, las órdenes de mover se rechazan con un aviso. Hay que esperar a que termine o pulsar Parar.
+La secuencia automática del sensor de pienso se guarda con `Preferences`, en la memoria no volátil del ESP32.
 
-El bloque de los relés tiene un campo de tiempo para cada relé, 1 segundo por defecto, y estos botones:
+## Estructura del repositorio
 
-| Botón | Qué hace |
-|---|---|
-| **Activar relé 1** | Enciende el relé 1 durante su tiempo y se apaga solo |
-| **Activar relé 2** | Enciende el relé 2 durante su tiempo y se apaga solo |
-| **Relé 1 y luego relé 2** | Activación en serie: enciende el relé 1 durante su tiempo y, al apagarse, el relé 2 durante el suyo |
-| **Relé 2 y luego relé 1** | Activación en serie al revés: primero el relé 2 y luego el relé 1, cada uno con su tiempo |
+```
+control_motor_paso_a_paso/
+  control_motor_paso_a_paso.ino   programa completo, con la página web incluida
+  credenciales.h.ejemplo          plantilla de las redes WiFi (copiar como credenciales.h)
+docu/
+  readme.txt                      cableado detallado, ajuste del driver y microstepping
+  *.pdf                           hojas de datos del motor, el driver y el ULN2803
+```
 
-En una activación en serie, el segundo relé espera apagado su turno. Una orden suelta a cualquier relé cancela la serie pendiente, igual que un cambio de modo con BOOT. Si se lanza otra serie mientras dura una, la nueva sustituye a la anterior.
+## Pendiente
 
-### Disparo
-
-El bloque naranja junta el motor y los relés. El botón **Realizar disparo** hace cuatro cosas seguidas:
-
-1. Avanza el **Ángulo de avance**, a la derecha.
-2. Retrocede el **Ángulo de retroceso**, a la izquierda. Con 0 grados se lo salta.
-3. Cuando el giro termina, espera 1 segundo (`DISPARO_ESPERA_MS`).
-4. Enciende los relés según la opción marcada debajo, cada uno con el tiempo de su casilla.
-
-| Opción | Qué hace al disparar |
-|---|---|
-| **Relé 1** | Enciende el relé 1 |
-| **Relé 2** | Enciende el relé 2 |
-| **Relé 1 y luego 2** | Enciende el relé 1 y, al apagarse, el relé 2 |
-| **Relé 2 y luego 1** | Enciende el relé 2 y, al apagarse, el relé 1 |
-
-**Parar**, una orden de girar o un cambio de modo con BOOT cancelan el disparo mientras gira o espera; si los relés ya se han encendido, siguen hasta acabar su tiempo. Mientras el motor gira, un disparo nuevo se rechaza, igual que las órdenes de mover.
-
-### Sensor de pienso (maqueta)
-
-El sensor aún no está conectado: el bloque morado deja preparada la parte de la página.
-
-- La casilla **Disparo automático al detectar pienso** activa o desactiva la secuencia automática.
-- Las cuatro opciones de debajo eligen qué relés se encienden: relé 1, relé 2, 1 y luego 2, o 2 y luego 1. Se usan los tiempos de las casillas de los relés.
-- La selección se guarda en la memoria del ESP32 cada vez que cambia la casilla, la opción o un tiempo de relé, y se mantiene al apagarlo.
-- **Simular detección** hace como si el sensor hubiera visto pienso: si la secuencia está activada, la lanza. El punto gris se pone verde 2 segundos con cada detección.
-
-Cuando haya sensor, se leerá en `loop()` y, al detectar pienso, se llamará a `piensoDetectado()`, la misma función que usa el botón.
-
-La línea de estado indica si el motor gira o está parado, con o sin corriente, en qué fase está el disparo, si cada relé está encendido y cuánto le queda y, durante una serie, qué relé se enciende después y durante cuánto tiempo.
-
-## Órdenes HTTP
-
-La página usa estas direcciones, que también se pueden llamar desde otro programa:
-
-| Dirección | Qué hace |
-|---|---|
-| `GET /` | Página de control |
-| `GET /mover?vueltas=1.5&sentido=der` | Gira 1,5 vueltas a la derecha. `sentido` es `der` o `izq` |
-| `GET /parar` | Para el motor |
-| `GET /rele?n=1&segundos=1` | Enciende el relé 1 ese tiempo y luego se apaga solo. Con `n=2`, el relé 2. Sin `n`, el relé 1 |
-| `GET /serie?orden=12&segundos1=1&segundos2=3` | Activación en serie: el relé 1 durante `segundos1` y, al apagarse, el relé 2 durante `segundos2`. Con `orden=21`, primero el relé 2. `segundos1` es siempre el tiempo del relé 1 |
-| `GET /velocidad?rpm=120` | Cambia la velocidad, de `RPM_MIN` a `RPM_MAX` vueltas por minuto. Vale también para el giro en curso |
-| `GET /disparo?vueltas=0.25&sentido=der&retroceso=0.125&modo=12&segundos1=1&segundos2=3` | Disparo: gira 0,25 vueltas a la derecha, retrocede 0,125 vueltas (opcional; sin `retroceso` o con 0 no retrocede), espera `DISPARO_ESPERA_MS` y enciende los relés según `modo`: `1`, `2`, `12` (relé 1 y luego relé 2) o `21` (relé 2 y luego relé 1). `segundos1` y `segundos2` son los tiempos del relé 1 y del relé 2 |
-| `GET /automatico?activo=1&modo=21&segundos1=1&segundos2=3` | Guarda la secuencia automática del sensor de pienso: activada (1) o no (0), modo de los relés y sus tiempos. Se mantiene al apagar el ESP32 |
-| `GET /pienso` | Simula que el sensor detecta pienso: si la secuencia automática está activada, la lanza |
-| `GET /estado` | Devuelve el estado en JSON: si se mueve, pulsos pendientes, sentido, pulsos por vuelta, si el motor tiene corriente, si cada relé está encendido y cuánto le queda (`rele`, `rele_ms_restantes`, `rele2`, `rele2_ms_restantes`) y, en una serie, qué relé va después y su tiempo (`serie_siguiente`, `serie_ms`; 0 si no hay serie), la fase del disparo (`disparo`: `girando` mientras avanza, `retrocediendo`, `esperando` o vacío) con su modo (`disparo_modo`), la velocidad (`rpm`), la secuencia automática (`auto_activo`, `auto_modo`) y las detecciones de pienso desde el arranque (`pienso_detecciones`) |
-
-## El servidor web
-
-El programa usa `esp_http_server`, el servidor web del propio sistema del ESP32. Atiende varias conexiones a la vez en su propia tarea y, cuando se llenan, cierra la menos usada para dejar entrar a la nueva.
-
-Versiones anteriores usaban la librería `WebServer` de Arduino, que atiende una sola conexión cada vez. Los navegadores abren conexiones por adelantado sin enviar nada, y al recargar la página lanzan varias peticiones a la vez. Con un servidor de una sola conexión, Parar llegaba tarde y la página se colgaba al actualizar. Los parches para cerrar conexiones vacías no lo resolvían del todo, así que se cambió de servidor.
-
-**Cómo se reparte el trabajo:**
-- **La web** se atiende en la tarea del servidor. Cada orden toma un candado solo mientras cambia el estado del motor o de los relés, y lo suelta antes de enviar la respuesta, para que un envío lento a un móvil con mala cobertura no frene nada.
-- **El bucle principal** se ocupa del fin de movimiento, la espera y el encendido del disparo, el apagado de los relés y el paso al segundo en una serie, el botón BOOT, la búsqueda de red y el LED.
-- **Los pulsos del motor** los da un temporizador, independiente de los dos anteriores.
-
-El botón Parar de la página reintenta el envío hasta 5 veces si falla.
-
-## Cómo se generan los pulsos
-
-Generar los pulsos con un bucle de `delayMicroseconds()` deja el ESP32 ocupado hasta que el motor termina: 10 vueltas a 2 ms por paso son 4 segundos sin atender la web ni el botón Parar.
-
-Una versión anterior los generaba en `loop()` comparando con `micros()`. Funcionaba, pero mientras la web respondía una petición, unos pocos milisegundos, no salían pulsos. El motor se frenaba de golpe y se oía un golpe seco cada segundo, cuando la página consulta el estado.
-
-Ahora `moverMotor()` configura DIR, apunta cuántos pulsos hay que dar y arranca un temporizador del ESP32 (`esp_timer`). El temporizador salta cada `PULSO_US` microsegundos y alterna la salida STEP en `darPaso()`, independientemente de lo que esté haciendo la web. El número de pulsos es siempre exacto. `PULSO_US` debe ser de 50 µs como mínimo, que es lo menos que admite el temporizador.
+- Sensor de pienso real: elegir el sensor, su pin y leerlo en `loop()`.
+- Rampa de aceleración, para alcanzar más velocidad sin perder pasos.

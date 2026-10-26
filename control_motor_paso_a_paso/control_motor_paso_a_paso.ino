@@ -68,13 +68,17 @@
     Generarlos en loop() comparando con micros() tampoco basta: mientras la web
     responde una peticion (unos milisegundos) no salen pulsos, el motor se
     frena de golpe y se oye un "pum".
-    Por eso los pulsos los da un temporizador del ESP32 (esp_timer) que salta
-    a intervalos fijos (segun la velocidad), pase lo que pase con la web.
+    Por eso los pulsos los da un temporizador hardware del ESP32 que salta a
+    intervalos fijos (segun la velocidad), pase lo que pase con la web. Su
+    interrupcion corre en el nucleo 1; la WiFi va en el nucleo 0. Con el
+    temporizador de software (esp_timer), que corre en el nucleo de la WiFi,
+    los pulsos se retrasaban hasta 0,5 ms en modo AP y casi 1 ms buscando red.
 */
 
 #include <WiFi.h>
 #include <ESPmDNS.h>          // nombre motor.local (viene con el core ESP32)
-#include "esp_timer.h"        // temporizador de los pulsos (viene con el core ESP32)
+#include "esp_timer.h"        // esp_timer_get_time(), para medir los pulsos (viene con el core)
+#include "hal/gpio_ll.h"      // escritura directa de STEP en la interrupcion (viene con el core)
 #include "esp_http_server.h"  // servidor web del sistema del ESP32 (viene con el core)
 #include "lwip/sockets.h"     // para saber la IP de quien hace cada peticion
 #include <Preferences.h>      // memoria que no se borra al apagar (viene con el core)
@@ -224,6 +228,17 @@
 
 httpd_handle_t servidor = NULL;
 
+// Respuesta de una orden. Las ordenes (/mover, /estado...) son las mismas por
+// la web y por el puerto serie: cada una recibe la consulta y devuelve esto.
+// (Va aqui arriba porque el IDE declara las funciones al principio.)
+const char* TEXTO = "text/plain; charset=utf-8";
+const char* JSON = "application/json";
+struct Respuesta {
+  int codigo;
+  const char* tipo;
+  String cuerpo;
+};
+
 // La web se atiende en la tarea del servidor y el resto (fin de movimiento,
 // reles, boton, WiFi) en loop(). Este candado evita que las dos toquen el
 // estado del motor y de los reles a la vez.
@@ -278,7 +293,13 @@ String autoModo = "1";                          // mismos modos que el disparo
 unsigned long autoMs1 = RELE_TIEMPO_S * 1000UL, autoMs2 = RELE_TIEMPO_S * 1000UL;
 unsigned long piensoDetecciones = 0;            // detecciones desde el arranque
 
-esp_timer_handle_t temporizadorPasos;
+// Modo de la WiFi. MODO_APAGADO (sin WiFi) solo se pide con /wifi?modo=apagado
+// por el puerto serie, para pruebas.
+enum ModoWifi { MODO_AP, MODO_BUSCANDO, MODO_HOST, MODO_APAGADO };
+ModoWifi modoWifi = MODO_AP;
+volatile int wifiPedido = -1;   // modo pedido con /wifi, lo aplica loop() (-1 = ninguno)
+
+hw_timer_t* temporizadorPasos = NULL;   // temporizador hardware de los pulsos
 portMUX_TYPE candadoMotor = portMUX_INITIALIZER_UNLOCKED;  // evita que el
                          // temporizador y la web toquen el estado a la vez
 
@@ -362,20 +383,38 @@ String ipCliente(httpd_req_t* req) {
   return "?";
 }
 
-// Valor de un parametro de la direccion (?vueltas=1.5&...). Vacio si no esta.
-String argumento(httpd_req_t* req, const char* nombre) {
-  char consulta[128];
+// Valor de un parametro de la consulta (lo que va tras '?' en
+// /mover?vueltas=1.5&sentido=der). Vacio si no esta.
+String argumento(const char* consulta, const char* nombre) {
   char valor[32];
-  if (httpd_req_get_url_query_str(req, consulta, sizeof(consulta)) != ESP_OK) return "";
   if (httpd_query_key_value(consulta, nombre, valor, sizeof(valor)) != ESP_OK) return "";
   return String(valor);
 }
 
-// Contadores del diagnostico (ver DIAGNOSTICO_MS). Los escribe la tarea del
-// servidor web y los lee y pone a cero loop().
+// Contadores del diagnostico (ver DIAGNOSTICO_MS y /diagnostico). Los
+// escriben la tarea del servidor web, el temporizador de los pulsos y loop(),
+// y los pone a cero reiniciarContadores().
 volatile unsigned long webPeticiones = 0;     // respuestas enviadas
 volatile unsigned long webFallos = 0;         // respuestas que no se pudieron enviar
 volatile unsigned long webEnvioMaxMs = 0;     // envio mas lento, en ms
+volatile unsigned long webAtencionMaxMs = 0;  // peticion mas lenta, de principio a fin, en ms
+volatile int64_t pasoAnteriorUs = 0;          // instante del cambio de STEP anterior (0 = primero)
+volatile unsigned long pasoDesvioMaxUs = 0;   // mayor desvio entre dos cambios de STEP
+                                              // respecto al medio periodo, en us
+volatile unsigned long pasoIrregulares = 0;   // cambios de STEP desviados mas del 20%
+volatile unsigned long pasoCambios = 0;       // cambios de STEP medidos
+volatile unsigned long bucleMaxUs = 0;        // pasada de loop() mas larga, en us
+
+void reiniciarContadores() {
+  webPeticiones = 0;
+  webFallos = 0;
+  webEnvioMaxMs = 0;
+  webAtencionMaxMs = 0;
+  pasoDesvioMaxUs = 0;
+  pasoIrregulares = 0;
+  pasoCambios = 0;
+  bucleMaxUs = 0;
+}
 
 // Envia la respuesta de la web y la anota: IP de quien pregunta, orden y
 // codigo de respuesta (con el texto, si es corto).
@@ -420,22 +459,48 @@ esp_err_t responder(httpd_req_t* req, int codigo, const char* tipo, const String
 //  MOTOR
 // ---------------------------------------------------------------------
 
-// Lo llama el temporizador cada pulsoUs microsegundos. Alterna STEP: un
-// pulso es ALTO durante pulsoUs y BAJO durante pulsoUs, y cuenta como dado
-// al bajar STEP.
-void darPaso(void* arg) {
-  portENTER_CRITICAL(&candadoMotor);
+// Interrupcion del temporizador, cada pulsoUs microsegundos. Alterna STEP:
+// un pulso es ALTO durante pulsoUs y BAJO durante pulsoUs, y cuenta como dado
+// al bajar STEP. Corre en el nucleo 1 (el de loop), lejos de la WiFi, que
+// trabaja en el nucleo 0: asi los pulsos salen a su hora aunque la WiFi este
+// ocupada. Escribe STEP directamente en el registro (gpio_ll_set_level), que
+// es mucho mas rapido que digitalWrite.
+void IRAM_ATTR darPaso() {
+  int64_t ahora = esp_timer_get_time();
+  portENTER_CRITICAL_ISR(&candadoMotor);
   if (pulsosPendientes > 0) {
+    // Diagnostico: cuanto se aparta este cambio de STEP del medio periodo
+    if (pasoAnteriorUs != 0) {
+      long desvio = (long)(ahora - pasoAnteriorUs) - (long)pulsoUs;
+      if (desvio < 0) desvio = -desvio;
+      if ((unsigned long)desvio > pasoDesvioMaxUs) pasoDesvioMaxUs = desvio;
+      if ((unsigned long)desvio * 5 > pulsoUs) pasoIrregulares++;
+      pasoCambios++;
+    }
+    pasoAnteriorUs = ahora;
     if (!stepEnAlto) {
-      digitalWrite(STEP_PIN, HIGH);
+      gpio_ll_set_level(&GPIO, STEP_PIN, 1);
       stepEnAlto = true;
     } else {
-      digitalWrite(STEP_PIN, LOW);
+      gpio_ll_set_level(&GPIO, STEP_PIN, 0);
       stepEnAlto = false;
       pulsosPendientes = pulsosPendientes - 1;
     }
   }
-  portEXIT_CRITICAL(&candadoMotor);
+  portEXIT_CRITICAL_ISR(&candadoMotor);
+}
+
+// Arranca el temporizador de los pulsos con el medio periodo pulsoUs, o lo para.
+void arrancarTemporizador() {
+  timerWrite(temporizadorPasos, 0);
+  timerAlarm(temporizadorPasos, pulsoUs, true, 0);
+  timerStart(temporizadorPasos);
+  temporizadorEnMarcha = true;
+}
+
+void pararTemporizador() {
+  if (temporizadorEnMarcha) timerStop(temporizadorPasos);
+  temporizadorEnMarcha = false;
 }
 
 // Da corriente a las bobinas (driver habilitado por EN).
@@ -457,7 +522,7 @@ void desactivarDriver() {
 // (true = derecha, false = izquierda) y arranca el temporizador.
 void moverMotor(long pulsos, bool direccion) {
   if (pulsos <= 0) return;
-  if (temporizadorEnMarcha) esp_timer_stop(temporizadorPasos);
+  pararTemporizador();
   activarDriver();
 
   // 1. Configurar DIR
@@ -470,9 +535,9 @@ void moverMotor(long pulsos, bool direccion) {
   digitalWrite(STEP_PIN, LOW);
   stepEnAlto = false;
   pulsosPendientes = pulsos;
+  pasoAnteriorUs = 0;
   portEXIT_CRITICAL(&candadoMotor);
-  esp_timer_start_periodic(temporizadorPasos, pulsoUs);
-  temporizadorEnMarcha = true;
+  arrancarTemporizador();
 }
 
 // Cambia la velocidad a 'rpm' vueltas por minuto (de RPM_MIN a RPM_MAX). Si
@@ -481,17 +546,17 @@ void cambiarVelocidad(int rpm) {
   rpmActual = rpm;
   // medio periodo = 60 s / (rpm * pulsos por vuelta) / 2
   pulsoUs = 30000000UL / ((unsigned long)rpm * PULSOS_POR_VUELTA);
-  if (pulsoUs < 50) pulsoUs = 50;     // minimo del temporizador del ESP32
+  if (pulsoUs < 50) pulsoUs = 50;     // mas rapido, la interrupcion ocuparia el procesador
   if (temporizadorEnMarcha) {
-    esp_timer_stop(temporizadorPasos);
-    esp_timer_start_periodic(temporizadorPasos, pulsoUs);
+    pararTemporizador();
+    pasoAnteriorUs = 0;   // el primer cambio con el periodo nuevo no cuenta como desvio
+    arrancarTemporizador();
   }
 }
 
 // Detiene el motor inmediatamente.
 void pararMotor() {
-  if (temporizadorEnMarcha) esp_timer_stop(temporizadorPasos);
-  temporizadorEnMarcha = false;
+  pararTemporizador();
   finMovimiento = millis();
   portENTER_CRITICAL(&candadoMotor);
   pulsosPendientes = 0;
@@ -505,8 +570,7 @@ void pararMotor() {
 // corriente cuando el motor lleva REPOSO_MS parado.
 void comprobarFinMovimiento() {
   if (temporizadorEnMarcha && pulsosPendientes == 0) {
-    esp_timer_stop(temporizadorPasos);
-    temporizadorEnMarcha = false;
+    pararTemporizador();
     finMovimiento = millis();
     aviso("[motor] movimiento terminado");
   }
@@ -963,42 +1027,58 @@ const char PAGINA[] PROGMEM = R"rawliteral(
 
 
 // ---------------------------------------------------------------------
-//  RESPUESTAS HTTP
+//  ORDENES (WEB Y PUERTO SERIE)
 // ---------------------------------------------------------------------
 
-// Cada manejador corre en la tarea del servidor web. Toma candadoEstado solo
-// mientras lee o cambia el estado del motor y de los reles, y lo suelta ANTES de
-// enviar la respuesta: asi un envio lento a un movil con mala cobertura nunca
-// frena el bucle principal ni el motor.
+// Las ordenes corren en la tarea del servidor web (peticiones de la web) o en
+// loop() (ordenes por el puerto serie). Toman candadoEstado solo mientras leen
+// o cambian el estado del motor y de los reles, y lo sueltan ANTES de enviar
+// la respuesta: asi un envio lento a un movil con mala cobertura nunca frena
+// el bucle principal ni el motor.
 
-// GET /  -> pagina de control
-esp_err_t paginaPrincipal(httpd_req_t* req) {
-  String html = PAGINA;
-  html.replace("%PPV%", String(PULSOS_POR_VUELTA));
-  html.replace("%RELE_S%", String(RELE_TIEMPO_S));
-  html.replace("%ESPERA_S%", String(DISPARO_ESPERA_MS / 1000.0, DISPARO_ESPERA_MS % 1000 ? 1 : 0));
-  xSemaphoreTake(candadoEstado, portMAX_DELAY);
-  int rpm = rpmActual;
-  xSemaphoreGive(candadoEstado);
-  html.replace("%RPM%", String(rpm));
-  html.replace("%RPM_MIN%", String(RPM_MIN));
-  html.replace("%RPM_MAX%", String(RPM_MAX));
+// Pagina de control ya preparada (la hace prepararPagina en setup). Antes se
+// copiaba y se rellenaba en cada visita: 15 KB de memoria y siete pasadas
+// por el texto cada vez que alguien abria o recargaba la pagina.
+String paginaLista;
+
+// Sustituye %PPV%, %RELE_S%... en PAGINA. %RPM% toma RPM_INICIAL: al abrirse,
+// la pagina pide /estado y pone en el deslizador la velocidad que tenga el
+// motor en ese momento.
+void prepararPagina() {
+  unsigned long inicio = millis();
+  paginaLista = PAGINA;
+  paginaLista.replace("%PPV%", String(PULSOS_POR_VUELTA));
+  paginaLista.replace("%RELE_S%", String(RELE_TIEMPO_S));
+  paginaLista.replace("%ESPERA_S%", String(DISPARO_ESPERA_MS / 1000.0, DISPARO_ESPERA_MS % 1000 ? 1 : 0));
+  paginaLista.replace("%RPM%", String(RPM_INICIAL));
+  paginaLista.replace("%RPM_MIN%", String(RPM_MIN));
+  paginaLista.replace("%RPM_MAX%", String(RPM_MAX));
   String gradosPaso = String(360.0 / PULSOS_POR_VUELTA, 3);   // 1.800 -> 1,8
   while (gradosPaso.endsWith("0")) gradosPaso.remove(gradosPaso.length() - 1);
   if (gradosPaso.endsWith(".")) gradosPaso.remove(gradosPaso.length() - 1);
   gradosPaso.replace(".", ",");
-  html.replace("%GRADOS_PASO%", gradosPaso);
-  return responder(req, 200, "text/html; charset=utf-8", html);
+  paginaLista.replace("%GRADOS_PASO%", gradosPaso);
+  aviso(String("[web] pagina preparada: ") + paginaLista.length() + " bytes en " +
+        (millis() - inicio) + " ms");
+}
+
+// GET /  -> pagina de control
+esp_err_t paginaPrincipal(httpd_req_t* req) {
+  unsigned long inicio = millis();
+  esp_err_t resultado = responder(req, 200, "text/html; charset=utf-8", paginaLista);
+  unsigned long ms = millis() - inicio;
+  if (ms > webAtencionMaxMs) webAtencionMaxMs = ms;
+  return resultado;
 }
 
 // Lee vueltas y sentido de la peticion y los pasa a pulsos. Devuelve "" si
 // son validos o el texto del error.
-String leerGiro(httpd_req_t* req, float& vueltas, long& pulsos, bool& derecha) {
-  String textoVueltas = argumento(req, "vueltas");
+String leerGiro(const char* consulta, float& vueltas, long& pulsos, bool& derecha) {
+  String textoVueltas = argumento(consulta, "vueltas");
   textoVueltas.replace(",", ".");          // admite 0,5 ademas de 0.5
   textoVueltas.replace("%2C", ".");        // la coma puede llegar codificada
   vueltas = textoVueltas.toFloat();
-  String sentido = argumento(req, "sentido");
+  String sentido = argumento(consulta, "sentido");
 
   if (vueltas <= 0 || vueltas > VUELTAS_MAX) {
     String error = "Número de vueltas no válido (entre 0 y ";
@@ -1017,10 +1097,10 @@ String leerGiro(httpd_req_t* req, float& vueltas, long& pulsos, bool& derecha) {
 
 // GET /mover?vueltas=1.5&sentido=der  (sentido: der o izq). Cancela el
 // disparo que estuviera esperando.
-esp_err_t ordenMover(httpd_req_t* req) {
+Respuesta ordenMover(const char* consulta) {
   float vueltas; long pulsos; bool derecha;
-  String error = leerGiro(req, vueltas, pulsos, derecha);
-  if (error != "") return responder(req, 400, "text/plain; charset=utf-8", error);
+  String error = leerGiro(consulta, vueltas, pulsos, derecha);
+  if (error != "") return Respuesta{400, TEXTO, error};
 
   bool ocupado;
   xSemaphoreTake(candadoEstado, portMAX_DELAY);
@@ -1032,29 +1112,28 @@ esp_err_t ordenMover(httpd_req_t* req) {
   xSemaphoreGive(candadoEstado);
 
   if (ocupado) {
-    return responder(req, 409, "text/plain; charset=utf-8",
-                     "El motor está girando. Espera a que termine o pulsa Parar.");
+    return Respuesta{409, TEXTO, "El motor está girando. Espera a que termine o pulsa Parar."};
   }
   String mensaje = derecha ? "Avanzando " : "Retrocediendo ";
   mensaje += String(vueltas * 360, 0);
   mensaje += derecha ? "° a la derecha (" : "° a la izquierda (";
   mensaje += pulsos;
   mensaje += " pulsos)";
-  return responder(req, 200, "text/plain; charset=utf-8", mensaje);
+  return Respuesta{200, TEXTO, mensaje};
 }
 
 // GET /parar  (para el motor y cancela el disparo si aun no ha encendido los reles)
-esp_err_t ordenParar(httpd_req_t* req) {
+Respuesta ordenParar(const char* consulta) {
   xSemaphoreTake(candadoEstado, portMAX_DELAY);
   cancelarDisparo();
   pararMotor();
   xSemaphoreGive(candadoEstado);
-  return responder(req, 200, "text/plain; charset=utf-8", "Motor parado.");
+  return Respuesta{200, TEXTO, "Motor parado."};
 }
 
 // Segundos de un parametro (admite coma). Devuelve -1 si no es valido.
-float segundosDe(httpd_req_t* req, const char* nombre) {
-  String texto = argumento(req, nombre);
+float segundosDe(const char* consulta, const char* nombre) {
+  String texto = argumento(consulta, nombre);
   texto.replace(",", ".");
   texto.replace("%2C", ".");
   float segundos = texto.toFloat();
@@ -1073,14 +1152,14 @@ String errorTiempoRele() {
 // GET /rele?n=2&segundos=3    -> lo mismo con el rele 2
 // Sin 'n' es el rele 1, como en las versiones de un solo rele. Cancela la
 // activacion en serie que hubiera pendiente.
-esp_err_t ordenRele(httpd_req_t* req) {
-  String n = argumento(req, "n");
+Respuesta ordenRele(const char* consulta) {
+  String n = argumento(consulta, "n");
   if (n == "") n = "1";
   if (n != "1" && n != "2") {
-    return responder(req, 400, "text/plain; charset=utf-8", "Relé no válido: n tiene que ser 1 o 2.");
+    return Respuesta{400, TEXTO, "Relé no válido: n tiene que ser 1 o 2."};
   }
-  float segundos = segundosDe(req, "segundos");
-  if (segundos < 0) return responder(req, 400, "text/plain; charset=utf-8", errorTiempoRele());
+  float segundos = segundosDe(consulta, "segundos");
+  if (segundos < 0) return Respuesta{400, TEXTO, errorTiempoRele()};
 
   xSemaphoreTake(candadoEstado, portMAX_DELAY);
   cancelarSerie();
@@ -1092,21 +1171,21 @@ esp_err_t ordenRele(httpd_req_t* req) {
   mensaje += " encendido ";
   mensaje += String(segundos, 1);
   mensaje += " s";
-  return responder(req, 200, "text/plain; charset=utf-8", mensaje);
+  return Respuesta{200, TEXTO, mensaje};
 }
 
 // GET /serie?orden=12&segundos1=1.5&segundos2=3
 //   -> activacion en serie: el rele 1 durante segundos1 y, al apagarse, el
 //      rele 2 durante segundos2. Con orden=21, primero el 2 y luego el 1
 //      (cada uno con su tiempo: segundos1 es siempre el del rele 1).
-esp_err_t ordenSerie(httpd_req_t* req) {
-  String tipo = argumento(req, "orden");
+Respuesta ordenSerie(const char* consulta) {
+  String tipo = argumento(consulta, "orden");
   if (tipo != "12" && tipo != "21") {
-    return responder(req, 400, "text/plain; charset=utf-8", "Orden no válido: tiene que ser 12 o 21.");
+    return Respuesta{400, TEXTO, "Orden no válido: tiene que ser 12 o 21."};
   }
-  float s1 = segundosDe(req, "segundos1");
-  float s2 = segundosDe(req, "segundos2");
-  if (s1 < 0 || s2 < 0) return responder(req, 400, "text/plain; charset=utf-8", errorTiempoRele());
+  float s1 = segundosDe(consulta, "segundos1");
+  float s2 = segundosDe(consulta, "segundos2");
+  if (s1 < 0 || s2 < 0) return Respuesta{400, TEXTO, errorTiempoRele()};
   unsigned long ms1 = (unsigned long)(s1 * 1000 + 0.5f), ms2 = (unsigned long)(s2 * 1000 + 0.5f);
 
   xSemaphoreTake(candadoEstado, portMAX_DELAY);
@@ -1120,25 +1199,25 @@ esp_err_t ordenSerie(httpd_req_t* req) {
   } else {
     mensaje += "2 " + String(s2, 1) + " s y luego relé 1 " + String(s1, 1) + " s";
   }
-  return responder(req, 200, "text/plain; charset=utf-8", mensaje);
+  return Respuesta{200, TEXTO, mensaje};
 }
 
 // GET /velocidad?rpm=120  -> cambia la velocidad (de RPM_MIN a RPM_MAX vueltas
 // por minuto). Vale tambien para el giro en curso.
-esp_err_t ordenVelocidad(httpd_req_t* req) {
-  int rpm = argumento(req, "rpm").toInt();
+Respuesta ordenVelocidad(const char* consulta) {
+  int rpm = argumento(consulta, "rpm").toInt();
   if (rpm < RPM_MIN || rpm > RPM_MAX) {
     String error = "Velocidad no válida (entre ";
     error += RPM_MIN;
     error += " y ";
     error += RPM_MAX;
     error += " rpm).";
-    return responder(req, 400, "text/plain; charset=utf-8", error);
+    return Respuesta{400, TEXTO, error};
   }
   xSemaphoreTake(candadoEstado, portMAX_DELAY);
   cambiarVelocidad(rpm);
   xSemaphoreGive(candadoEstado);
-  return responder(req, 200, "text/plain; charset=utf-8", "Velocidad: " + String(rpm) + " rpm");
+  return Respuesta{200, TEXTO, "Velocidad: " + String(rpm) + " rpm"};
 }
 
 // GET /disparo?vueltas=0.25&sentido=der&retroceso=0.1&modo=12&segundos1=1&segundos2=3
@@ -1146,26 +1225,26 @@ esp_err_t ordenVelocidad(httpd_req_t* req) {
 //      retroceso o con 0 no retrocede), espera DISPARO_ESPERA_MS y enciende
 //      los reles segun 'modo': 1, 2, 12 (rele 1 y luego rele 2) o 21 (al
 //      reves), el rele 1 durante segundos1 y el rele 2 durante segundos2.
-esp_err_t ordenDisparo(httpd_req_t* req) {
+Respuesta ordenDisparo(const char* consulta) {
   float vueltas; long pulsos; bool derecha;
-  String error = leerGiro(req, vueltas, pulsos, derecha);
-  if (error != "") return responder(req, 400, "text/plain; charset=utf-8", error);
-  String textoRetroceso = argumento(req, "retroceso");
+  String error = leerGiro(consulta, vueltas, pulsos, derecha);
+  if (error != "") return Respuesta{400, TEXTO, error};
+  String textoRetroceso = argumento(consulta, "retroceso");
   textoRetroceso.replace(",", ".");
   textoRetroceso.replace("%2C", ".");
   float retroceso = textoRetroceso.toFloat();
   if (retroceso < 0 || retroceso > VUELTAS_MAX) {
-    return responder(req, 400, "text/plain; charset=utf-8", "Retroceso no válido.");
+    return Respuesta{400, TEXTO, "Retroceso no válido."};
   }
   long pulsosRetroceso = (long)(retroceso * PULSOS_POR_VUELTA + 0.5f);
-  String modo = argumento(req, "modo");
+  String modo = argumento(consulta, "modo");
   if (modo != "1" && modo != "2" && modo != "12" && modo != "21") {
-    return responder(req, 400, "text/plain; charset=utf-8", "Modo de disparo no válido: 1, 2, 12 o 21.");
+    return Respuesta{400, TEXTO, "Modo de disparo no válido: 1, 2, 12 o 21."};
   }
   // solo hacen falta los tiempos de los reles que se usan
-  float s1 = (modo == "2") ? 1 : segundosDe(req, "segundos1");
-  float s2 = (modo == "1") ? 1 : segundosDe(req, "segundos2");
-  if (s1 < 0 || s2 < 0) return responder(req, 400, "text/plain; charset=utf-8", errorTiempoRele());
+  float s1 = (modo == "2") ? 1 : segundosDe(consulta, "segundos1");
+  float s2 = (modo == "1") ? 1 : segundosDe(consulta, "segundos2");
+  if (s1 < 0 || s2 < 0) return Respuesta{400, TEXTO, errorTiempoRele()};
 
   bool ocupado;
   xSemaphoreTake(candadoEstado, portMAX_DELAY);
@@ -1182,8 +1261,7 @@ esp_err_t ordenDisparo(httpd_req_t* req) {
   xSemaphoreGive(candadoEstado);
 
   if (ocupado) {
-    return responder(req, 409, "text/plain; charset=utf-8",
-                     "El motor está girando. Espera a que termine o pulsa Parar.");
+    return Respuesta{409, TEXTO, "El motor está girando. Espera a que termine o pulsa Parar."};
   }
   String mensaje = "Disparo: ";
   mensaje += String(vueltas * 360, 0);
@@ -1199,25 +1277,25 @@ esp_err_t ordenDisparo(httpd_req_t* req) {
   else if (modo == "2") mensaje += "relé 2";
   else if (modo == "12") mensaje += "relé 1 y luego relé 2";
   else mensaje += "relé 2 y luego relé 1";
-  return responder(req, 200, "text/plain; charset=utf-8", mensaje);
+  return Respuesta{200, TEXTO, mensaje};
 }
 
 // GET /automatico?activo=1&modo=12&segundos1=1&segundos2=3
 //   -> guarda la secuencia que se lanza sola al detectar pienso: activada o
 //      no, modo de los reles (1, 2, 12 o 21) y sus tiempos. Se mantiene al
 //      apagar el ESP32.
-esp_err_t ordenAutomatico(httpd_req_t* req) {
-  String activo = argumento(req, "activo");
+Respuesta ordenAutomatico(const char* consulta) {
+  String activo = argumento(consulta, "activo");
   if (activo != "0" && activo != "1") {
-    return responder(req, 400, "text/plain; charset=utf-8", "activo tiene que ser 0 o 1.");
+    return Respuesta{400, TEXTO, "activo tiene que ser 0 o 1."};
   }
-  String modo = argumento(req, "modo");
+  String modo = argumento(consulta, "modo");
   if (modo != "1" && modo != "2" && modo != "12" && modo != "21") {
-    return responder(req, 400, "text/plain; charset=utf-8", "Modo no válido: 1, 2, 12 o 21.");
+    return Respuesta{400, TEXTO, "Modo no válido: 1, 2, 12 o 21."};
   }
-  float s1 = segundosDe(req, "segundos1");
-  float s2 = segundosDe(req, "segundos2");
-  if (s1 < 0 || s2 < 0) return responder(req, 400, "text/plain; charset=utf-8", errorTiempoRele());
+  float s1 = segundosDe(consulta, "segundos1");
+  float s2 = segundosDe(consulta, "segundos2");
+  if (s1 < 0 || s2 < 0) return Respuesta{400, TEXTO, errorTiempoRele()};
 
   xSemaphoreTake(candadoEstado, portMAX_DELAY);
   autoActivo = (activo == "1");
@@ -1237,17 +1315,17 @@ esp_err_t ordenAutomatico(httpd_req_t* req) {
   } else {
     mensaje += "desactivado";
   }
-  return responder(req, 200, "text/plain; charset=utf-8", mensaje);
+  return Respuesta{200, TEXTO, mensaje};
 }
 
 // GET /pienso  -> simula que el sensor detecta pienso (maqueta hasta que haya sensor)
-esp_err_t ordenPienso(httpd_req_t* req) {
+Respuesta ordenPienso(const char* consulta) {
   xSemaphoreTake(candadoEstado, portMAX_DELAY);
   bool disparado = piensoDetectado("simulado");
   xSemaphoreGive(candadoEstado);
-  return responder(req, 200, "text/plain; charset=utf-8", disparado
+  return Respuesta{200, TEXTO, disparado
                    ? "Pienso detectado (simulado): secuencia automática lanzada."
-                   : "Pienso detectado (simulado), pero el disparo automático está desactivado.");
+                   : "Pienso detectado (simulado), pero el disparo automático está desactivado."};
 }
 
 // GET /estado  -> {"moviendo":true,"pulsos_pendientes":120,"sentido":"derecha",
@@ -1259,7 +1337,7 @@ esp_err_t ordenPienso(httpd_req_t* req) {
 //  serie_siguiente es el rele que se enciende despues en una serie, 0 si no hay;
 //  disparo es "girando" (avance), "retrocediendo", "esperando" o "" si no hay
 //  ninguno pendiente)
-esp_err_t ordenEstado(httpd_req_t* req) {
+Respuesta ordenEstado(const char* consulta) {
   xSemaphoreTake(candadoEstado, portMAX_DELAY);
   long pendientes = pulsosPendientes;
   bool derecha = sentidoDerecha;
@@ -1280,42 +1358,130 @@ esp_err_t ordenEstado(httpd_req_t* req) {
   unsigned long detecciones = piensoDetecciones;
   xSemaphoreGive(candadoEstado);
 
-  String json = "{\"moviendo\":";
-  json += (pendientes > 0) ? "true" : "false";
-  json += ",\"pulsos_pendientes\":";
-  json += pendientes;
-  json += ",\"sentido\":\"";
-  json += derecha ? "derecha" : "izquierda";
-  json += "\",\"pulsos_por_vuelta\":";
-  json += PULSOS_POR_VUELTA;
-  json += ",\"con_corriente\":";
-  json += conCorriente ? "true" : "false";
-  json += ",\"rele\":";
-  json += rele ? "true" : "false";
-  json += ",\"rele_ms_restantes\":";
-  json += restante;
-  json += ",\"rele2\":";
-  json += rele2 ? "true" : "false";
-  json += ",\"rele2_ms_restantes\":";
-  json += restante2;
-  json += ",\"serie_siguiente\":";
-  json += serieSig;
-  json += ",\"serie_ms\":";
-  json += msSerie;
-  json += ",\"disparo\":\"";
-  json += fase;
-  json += "\",\"disparo_modo\":\"";
-  json += modo;
-  json += "\",\"rpm\":";
-  json += rpm;
-  json += ",\"auto_activo\":";
-  json += automatico ? "true" : "false";
-  json += ",\"auto_modo\":\"";
-  json += modoAuto;
-  json += "\",\"pienso_detecciones\":";
-  json += detecciones;
-  json += "}";
-  return responder(req, 200, "application/json", json);
+  // Se compone de una vez en un bufer: la pagina lo pide cada segundo y asi
+  // no hay que ir alargando un String (y pidiendo memoria) campo a campo.
+  char json[512];
+  snprintf(json, sizeof(json),
+           "{\"moviendo\":%s,\"pulsos_pendientes\":%ld,\"sentido\":\"%s\","
+           "\"pulsos_por_vuelta\":%d,\"con_corriente\":%s,"
+           "\"rele\":%s,\"rele_ms_restantes\":%lu,\"rele2\":%s,\"rele2_ms_restantes\":%lu,"
+           "\"serie_siguiente\":%d,\"serie_ms\":%lu,\"disparo\":\"%s\",\"disparo_modo\":\"%s\","
+           "\"rpm\":%d,\"auto_activo\":%s,\"auto_modo\":\"%s\",\"pienso_detecciones\":%lu}",
+           pendientes > 0 ? "true" : "false", pendientes, derecha ? "derecha" : "izquierda",
+           PULSOS_POR_VUELTA, conCorriente ? "true" : "false",
+           rele ? "true" : "false", restante, rele2 ? "true" : "false", restante2,
+           serieSig, msSerie, fase, modo.c_str(),
+           rpm, automatico ? "true" : "false", modoAuto.c_str(), detecciones);
+  return Respuesta{200, JSON, json};
+}
+
+// GET /diagnostico  -> {"segundos":95,"memoria_libre":211000,"memoria_minima":209000,
+//                       "bloque_mayor":110000,"peticiones":40,"sin_enviar":0,
+//                       "envio_max_ms":3,"atencion_max_ms":5,"pasos_medidos":3000,
+//                       "paso_desvio_max_us":45,"pasos_irregulares":0,
+//                       "bucle_max_us":1150,"modo_wifi":"ap","dispositivos":1,"rssi":0}
+// Contadores desde la ultima puesta a cero (la linea [sistema] los pone a
+// cero cada DIAGNOSTICO_MS, y esta orden con ?reiniciar=1 despues de leerlos).
+// pasos_medidos son los cambios de STEP y paso_desvio_max_us cuanto se ha
+// apartado el peor del medio periodo; pasos_irregulares, los que se apartan
+// mas del 20%. Con pulsos regulares el motor gira suave.
+Respuesta ordenDiagnostico(const char* consulta) {
+  const char* modo = modoWifi == MODO_AP ? "ap" : modoWifi == MODO_HOST ? "host"
+                   : modoWifi == MODO_BUSCANDO ? "buscando" : "apagado";
+  int rssi = (modoWifi == MODO_HOST && WiFi.status() == WL_CONNECTED) ? WiFi.RSSI() : 0;
+  char json[480];
+  snprintf(json, sizeof(json),
+           "{\"segundos\":%lu,\"memoria_libre\":%lu,\"memoria_minima\":%lu,\"bloque_mayor\":%lu,"
+           "\"peticiones\":%lu,\"sin_enviar\":%lu,\"envio_max_ms\":%lu,\"atencion_max_ms\":%lu,"
+           "\"pasos_medidos\":%lu,\"paso_desvio_max_us\":%lu,\"pasos_irregulares\":%lu,"
+           "\"bucle_max_us\":%lu,\"modo_wifi\":\"%s\",\"dispositivos\":%d,\"rssi\":%d}",
+           millis() / 1000, (unsigned long)ESP.getFreeHeap(), (unsigned long)ESP.getMinFreeHeap(),
+           (unsigned long)ESP.getMaxAllocHeap(), webPeticiones, webFallos, webEnvioMaxMs,
+           webAtencionMaxMs, pasoCambios, pasoDesvioMaxUs, pasoIrregulares, bucleMaxUs, modo,
+           WiFi.softAPgetStationNum(), rssi);
+  if (argumento(consulta, "reiniciar") == "1") reiniciarContadores();
+  return Respuesta{200, JSON, json};
+}
+
+// GET /wifi?modo=ap  -> cambia de modo como el boton BOOT: ap (red propia),
+// host (WiFi de casa) o apagado (sin WiFi, para pruebas por el puerto serie).
+// Como BOOT, para el motor y apaga los reles. Por la web se pierde la
+// conexion, asi que es sobre todo para el puerto serie.
+Respuesta ordenWifi(const char* consulta) {
+  String modo = argumento(consulta, "modo");
+  if (modo == "ap") wifiPedido = MODO_AP;
+  else if (modo == "host") wifiPedido = MODO_BUSCANDO;
+  else if (modo == "apagado") wifiPedido = MODO_APAGADO;
+  else return Respuesta{400, TEXTO, "Modo no válido: ap, host o apagado."};
+  return Respuesta{200, TEXTO, "Cambiando a modo " + modo};
+}
+
+// Ordenes que se atienden igual por la web y por el puerto serie
+typedef Respuesta (*Orden)(const char* consulta);
+struct Ruta {
+  const char* uri;
+  Orden orden;
+};
+const Ruta RUTAS[] = {
+  { "/mover",       ordenMover },
+  { "/parar",       ordenParar },
+  { "/estado",      ordenEstado },
+  { "/rele",        ordenRele },
+  { "/serie",       ordenSerie },
+  { "/disparo",     ordenDisparo },
+  { "/velocidad",   ordenVelocidad },
+  { "/automatico",  ordenAutomatico },
+  { "/pienso",      ordenPienso },
+  { "/diagnostico", ordenDiagnostico },
+  { "/wifi",        ordenWifi },
+};
+const int NUM_RUTAS = sizeof(RUTAS) / sizeof(RUTAS[0]);
+
+// Peticion de la web a una de las RUTAS: saca la consulta, ejecuta la orden
+// (user_ctx) y envia la respuesta.
+esp_err_t atenderOrden(httpd_req_t* req) {
+  unsigned long inicio = millis();
+  char consulta[160];
+  if (httpd_req_get_url_query_str(req, consulta, sizeof(consulta)) != ESP_OK) consulta[0] = '\0';
+  Respuesta r = ((Orden)req->user_ctx)(consulta);
+  esp_err_t resultado = responder(req, r.codigo, r.tipo, r.cuerpo);
+  unsigned long ms = millis() - inicio;
+  if (ms > webAtencionMaxMs) webAtencionMaxMs = ms;
+  return resultado;
+}
+
+// Se llama en loop(): lee las ordenes que llegan por el puerto serie, una por
+// linea y con la misma forma que en la web (/mover?vueltas=0.25&sentido=der),
+// y contesta con una linea "> codigo texto". Asi un programa del PC controla
+// el motor por el cable USB, sin WiFi.
+void atenderSerie() {
+  static char linea[200];
+  static size_t largo = 0;
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == '\r') continue;
+    if (c != '\n') {
+      if (largo < sizeof(linea) - 1) linea[largo++] = c;
+      continue;
+    }
+    linea[largo] = '\0';
+    largo = 0;
+    if (linea[0] == '\0') continue;
+    char* interrogacion = strchr(linea, '?');
+    const char* consulta = "";
+    if (interrogacion) {
+      *interrogacion = '\0';
+      consulta = interrogacion + 1;
+    }
+    Respuesta r = { 404, TEXTO, "Orden no encontrada. Ejemplos: /estado, /parar, /mover?vueltas=0.25&sentido=der" };
+    for (int i = 0; i < NUM_RUTAS; i++) {
+      if (strcmp(linea, RUTAS[i].uri) == 0) {
+        r = RUTAS[i].orden(consulta);
+        break;
+      }
+    }
+    Serial.printf("> %d %s\n", r.codigo, r.cuerpo.c_str());
+  }
 }
 
 // Cualquier otra direccion (por ejemplo, el icono /favicon.ico)
@@ -1333,7 +1499,7 @@ void arrancarServidorWeb() {
   config.max_open_sockets = WEB_MAX_CONEXIONES;
   config.lru_purge_enable = true;   // si se llena, cierra la conexion menos usada
   config.stack_size = 8192;         // margen para construir la pagina y los textos
-  config.max_uri_handlers = 12;     // por defecto solo admite 8 direcciones
+  config.max_uri_handlers = 16;     // por defecto solo admite 8 direcciones
 
   // El servidor atiende las peticiones de una en una. Si un movil deja una
   // conexion a medias (pantalla apagada, cambio a datos moviles...), el
@@ -1352,19 +1518,13 @@ void arrancarServidorWeb() {
     aviso("[web] ERROR: no se pudo arrancar el servidor web");
     return;
   }
-  httpd_uri_t rutas[] = {
-    { .uri = "/",       .method = HTTP_GET, .handler = paginaPrincipal, .user_ctx = NULL },
-    { .uri = "/mover",  .method = HTTP_GET, .handler = ordenMover,      .user_ctx = NULL },
-    { .uri = "/parar",  .method = HTTP_GET, .handler = ordenParar,      .user_ctx = NULL },
-    { .uri = "/estado", .method = HTTP_GET, .handler = ordenEstado,     .user_ctx = NULL },
-    { .uri = "/rele",   .method = HTTP_GET, .handler = ordenRele,       .user_ctx = NULL },
-    { .uri = "/serie",  .method = HTTP_GET, .handler = ordenSerie,      .user_ctx = NULL },
-    { .uri = "/disparo", .method = HTTP_GET, .handler = ordenDisparo,   .user_ctx = NULL },
-    { .uri = "/velocidad", .method = HTTP_GET, .handler = ordenVelocidad, .user_ctx = NULL },
-    { .uri = "/automatico", .method = HTTP_GET, .handler = ordenAutomatico, .user_ctx = NULL },
-    { .uri = "/pienso", .method = HTTP_GET, .handler = ordenPienso,     .user_ctx = NULL },
-  };
-  for (auto& ruta : rutas) httpd_register_uri_handler(servidor, &ruta);
+  httpd_uri_t pagina = { .uri = "/", .method = HTTP_GET, .handler = paginaPrincipal, .user_ctx = NULL };
+  httpd_register_uri_handler(servidor, &pagina);
+  for (int i = 0; i < NUM_RUTAS; i++) {
+    httpd_uri_t ruta = { .uri = RUTAS[i].uri, .method = HTTP_GET, .handler = atenderOrden,
+                         .user_ctx = (void*)RUTAS[i].orden };
+    httpd_register_uri_handler(servidor, &ruta);
+  }
   httpd_register_err_handler(servidor, HTTPD_404_NOT_FOUND, paginaNoEncontrada);
   aviso("[web] servidor web en marcha (puerto 80)");
 }
@@ -1373,10 +1533,6 @@ void arrancarServidorWeb() {
 // ---------------------------------------------------------------------
 //  WIFI
 // ---------------------------------------------------------------------
-
-// Modo de la WiFi
-enum ModoWifi { MODO_AP, MODO_BUSCANDO, MODO_HOST };
-ModoWifi modoWifi = MODO_AP;
 
 // Redes WiFi que se prueban en orden en modo host (claves en credenciales.h).
 const char* REDES_SSID[]  = { WIFI_ROUTER_SSID,     WIFI_ROUTER2_SSID };
@@ -1394,6 +1550,11 @@ void actualizarLed() {
   if (modoWifi == MODO_HOST && WiFi.status() == WL_CONNECTED) {
     digitalWrite(LED_PIN, LED_ENCENDIDO);
     encendido = true;
+    return;
+  }
+  if (modoWifi == MODO_APAGADO) {
+    digitalWrite(LED_PIN, !LED_ENCENDIDO);
+    encendido = false;
     return;
   }
   unsigned long medioPeriodo = (modoWifi == MODO_AP) ? LED_AP_MS : LED_AP_MS / 2;
@@ -1452,6 +1613,9 @@ void empezarBusqueda() {
   WiFi.mode(WIFI_OFF);
   WiFi.setHostname(NOMBRE_RED);
   WiFi.mode(WIFI_STA);
+  // Sin ahorro de energia: con el, la WiFi duerme entre balizas del router y
+  // cada peticion de la web puede esperar cientos de ms a que despierte.
+  WiFi.setSleep(false);
   modoWifi = MODO_BUSCANDO;
   redActual = -1;
   aviso("[wifi] modo host: buscando red");
@@ -1474,10 +1638,20 @@ void actualizarWifi() {
   }
 }
 
-// Cambia de modo al pulsar BOOT: de AP a host, o de host (o buscando) a AP.
-// Antes para el motor y apaga los reles, porque se pierde la conexion con la web.
-void cambiarModoWifi() {
-  aviso("[boton] BOOT pulsado: paro motor, disparo y reles y cambio de modo");
+// Sin WiFi (solo para pruebas, con /wifi?modo=apagado).
+void apagarWifi() {
+  WiFi.softAPdisconnect(true);
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  modoWifi = MODO_APAGADO;
+  aviso("[wifi] WiFi apagada (solo puerto serie)");
+}
+
+// Cambia al modo 'destino': MODO_AP, MODO_BUSCANDO (modo host) o
+// MODO_APAGADO. Antes para el motor y apaga los reles, porque se pierde la
+// conexion con la web.
+void cambiarModoWifi(ModoWifi destino, const char* motivo) {
+  aviso(String(motivo) + ": paro motor, disparo y reles y cambio de modo");
   xSemaphoreTake(candadoEstado, portMAX_DELAY);
   cancelarDisparo();
   pararMotor();
@@ -1486,11 +1660,9 @@ void cambiarModoWifi() {
     if (reles[i].encendido) apagarRele(i);
   }
   xSemaphoreGive(candadoEstado);
-  if (modoWifi == MODO_AP) {
-    empezarBusqueda();
-  } else {
-    entrarModoAP();
-  }
+  if (destino == MODO_BUSCANDO) empezarBusqueda();
+  else if (destino == MODO_APAGADO) apagarWifi();
+  else entrarModoAP();
 }
 
 // Se llama en loop(): cada DIAGNOSTICO_MS escribe la linea [sistema] y pone a
@@ -1500,9 +1672,6 @@ void diagnostico() {
   if (!DEPURACION || millis() - ultimo < DIAGNOSTICO_MS) return;
   ultimo = millis();
   unsigned long peticiones = webPeticiones, fallos = webFallos, envioMax = webEnvioMaxMs;
-  webPeticiones = 0;
-  webFallos = 0;
-  webEnvioMaxMs = 0;
   String linea = "[sistema] ";
   linea += DIAGNOSTICO_MS / 1000;
   linea += " s: ";
@@ -1511,7 +1680,15 @@ void diagnostico() {
   linea += fallos;
   linea += " sin enviar, envio mas lento ";
   linea += envioMax;
-  linea += " ms | memoria libre ";
+  linea += " ms, peticion mas lenta ";
+  linea += webAtencionMaxMs;
+  linea += " ms | pulsos: desvio max ";
+  linea += pasoDesvioMaxUs;
+  linea += " us, ";
+  linea += pasoIrregulares;
+  linea += " irregulares | bucle max ";
+  linea += bucleMaxUs;
+  linea += " us | memoria libre ";
   linea += ESP.getFreeHeap();
   linea += " B, minima ";
   linea += ESP.getMinFreeHeap();
@@ -1520,6 +1697,7 @@ void diagnostico() {
   linea += " B | en la red propia: ";
   linea += WiFi.softAPgetStationNum();
   aviso(linea);
+  reiniciarContadores();
 }
 
 // Se llama en loop(): detecta la pulsacion corta de BOOT, con antirrebote.
@@ -1537,7 +1715,8 @@ void leerBoot() {
   if (pulsado != pulsadoAntes && millis() - ultimoCambio >= ANTIRREBOTE_MS) {
     ultimoCambio = millis();
     pulsadoAntes = pulsado;
-    if (pulsado) cambiarModoWifi();
+    // de AP a host; de host, buscando o apagado, a AP
+    if (pulsado) cambiarModoWifi(modoWifi == MODO_AP ? MODO_BUSCANDO : MODO_AP, "[boton] BOOT pulsado");
   }
 }
 
@@ -1547,6 +1726,10 @@ void leerBoot() {
 // ---------------------------------------------------------------------
 
 void setup() {
+  // Bufer de envio del Monitor Serie: sin el, cada linea deja esperando a
+  // quien la escribe hasta que sale por el cable (a 115200 baudios, unos 9 ms
+  // cada 100 caracteres; la linea [sistema] paraba loop() 24 ms).
+  Serial.setTxBufferSize(4096);
   Serial.begin(115200);
   delay(500);
 
@@ -1583,11 +1766,12 @@ void setup() {
   ajustes.begin("motor", false);
   leerAutomatico();
 
-  // Temporizador que da los pulsos (se arranca en moverMotor)
-  esp_timer_create_args_t argsTemporizador = {};
-  argsTemporizador.callback = &darPaso;
-  argsTemporizador.name = "pasos";
-  esp_timer_create(&argsTemporizador, &temporizadorPasos);
+  // Temporizador hardware que da los pulsos, contando en microsegundos. Se
+  // crea aqui, en el nucleo 1, para que su interrupcion corra en ese nucleo.
+  // timerBegin lo deja en marcha: se para hasta que moverMotor lo arranque.
+  temporizadorPasos = timerBegin(1000000);
+  timerStop(temporizadorPasos);
+  timerAttachInterrupt(temporizadorPasos, &darPaso);
 
   Serial.println();
   Serial.println("Control motor paso a paso");
@@ -1605,16 +1789,29 @@ void setup() {
   Serial.println(PULSOS_POR_VUELTA);
 
   // Servidor web (atiende en su propia tarea; loop() no tiene que llamarlo)
+  prepararPagina();
   arrancarServidorWeb();
 }
 
 void loop() {
+  // Diagnostico: tiempo desde la pasada anterior (incluye el delay(1) del final)
+  static unsigned long pasadaAnterior = 0;
+  unsigned long ahora = micros();
+  if (pasadaAnterior != 0 && ahora - pasadaAnterior > bucleMaxUs) bucleMaxUs = ahora - pasadaAnterior;
+  pasadaAnterior = ahora;
+
   xSemaphoreTake(candadoEstado, portMAX_DELAY);
   comprobarFinMovimiento();   // para el temporizador al acabar los pulsos
   comprobarDisparo();         // tras el giro del disparo, espera y enciende los reles
   comprobarReles();           // apaga cada rele cuando acaba su tiempo (y sigue las series)
   xSemaphoreGive(candadoEstado);
 
+  atenderSerie();             // ordenes por el puerto serie (las mismas que la web)
+  if (wifiPedido >= 0) {      // cambio de modo pedido con /wifi
+    ModoWifi destino = (ModoWifi)wifiPedido;
+    wifiPedido = -1;
+    cambiarModoWifi(destino, "[wifi] orden /wifi");
+  }
   leerBoot();                 // pulsacion de BOOT: cambia entre modo AP y host
   actualizarWifi();           // sigue la busqueda de red en modo host
   actualizarLed();            // parpadeo en AP, doble de rapido buscando, fijo conectado

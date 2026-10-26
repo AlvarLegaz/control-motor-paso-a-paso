@@ -12,7 +12,8 @@ Funciona con cualquier driver de entradas STEP y DIR: A4988, DRV8825, TMC2208, T
 - Secuencia automática al detectar pienso. El sensor aún no está conectado: la página permite elegir la secuencia y simular la detección.
 - Red propia (modo AP) o WiFi de casa (modo host), con cambio de modo en el botón BOOT de la placa.
 - Órdenes HTTP sencillas para controlarlo también desde otro programa.
-- Mensajes de depuración y diagnóstico por el Monitor Serie.
+- Las mismas órdenes por el cable USB (puerto serie), con una app para el PC que no necesita WiFi.
+- Mensajes de depuración y diagnóstico por el Monitor Serie, con medidas de rendimiento: regularidad de los pulsos, bucle principal y memoria.
 
 ## Material
 
@@ -200,6 +201,8 @@ La página usa estas direcciones, que también se pueden llamar desde otro progr
 | `/automatico?activo=1&modo=21&segundos1=1&segundos2=3` | Guarda la secuencia automática del sensor de pienso: activada (`1`) o no (`0`), modo y tiempos |
 | `/pienso` | Simula una detección de pienso |
 | `/estado` | Estado en JSON (ver abajo) |
+| `/diagnostico` | Medidas de rendimiento en JSON (ver [Rendimiento](#rendimiento)). Con `?reiniciar=1` pone los contadores a cero después de leerlos |
+| `/wifi?modo=ap` | Cambia de modo como el botón BOOT: `ap`, `host` o `apagado` (sin WiFi, para pruebas). Para el motor y apaga los relés. Pensada para el puerto serie: por la web se pierde la conexión |
 
 Campos de `/estado`:
 
@@ -214,6 +217,26 @@ Campos de `/estado`:
 | `auto_activo`, `auto_modo` | Secuencia automática del sensor de pienso |
 | `pienso_detecciones` | Detecciones de pienso desde el arranque |
 
+## Control desde el PC por el puerto serie
+
+Todas las órdenes de la tabla anterior, salvo la página `/`, se pueden escribir también en el Monitor Serie, una por línea y con la misma forma: `/mover?vueltas=0.25&sentido=der`. El ESP32 contesta con una línea que empieza por `>`, el código y el texto:
+
+```
+/velocidad?rpm=120
+> 200 Velocidad: 120 rpm
+```
+
+La carpeta [pc](pc) tiene `control_serie.py`, una app para el PC que usa el puerto serie, sin WiFi. Necesita Python y pyserial (`py -m pip install pyserial`). Antes de abrirla, cierra el Monitor Serie de Arduino IDE, porque el puerto solo lo puede usar un programa a la vez.
+
+| Orden | Qué hace |
+|---|---|
+| `py pc/control_serie.py` | Ventana con el motor, los relés, el disparo, el estado y el Monitor Serie |
+| `py pc/control_serie.py --orden /estado` | Envía una o varias órdenes (`--orden` repetido) y muestra las respuestas |
+| `py pc/control_serie.py --prueba` | Prueba de rendimiento: gira unas 3 s a 25, 100, 200 y 300 rpm (`--rpm` para otras) y muestra la regularidad de los pulsos |
+| `py pc/control_serie.py --monitor 30` | Muestra el Monitor Serie durante 30 s |
+
+Busca sola el puerto del ESP32; si hay varios, indícalo con `--puerto COM3`.
+
 ## Monitor Serie y diagnóstico
 
 El Monitor Serie, a **115200 baudios**, muestra cada mensaje con los segundos desde el arranque y una etiqueta:
@@ -227,7 +250,7 @@ El Monitor Serie, a **115200 baudios**, muestra cada mensaje con los segundos de
 | `[disparo]` | Fases del disparo y disparos cancelados |
 | `[pienso]` | Detecciones de pienso y si se lanza la secuencia automática |
 | `[boton]` | Pulsación de BOOT |
-| `[sistema]` | Cada 30 s: peticiones atendidas, respuestas no enviadas, envío más lento, memoria libre, mínima y bloque mayor, y dispositivos en la red propia |
+| `[sistema]` | Cada 30 s: peticiones atendidas, respuestas no enviadas, envío y petición más lentos, desvío máximo de los pulsos y pulsos irregulares, pasada más larga del bucle, memoria libre, mínima y bloque mayor, y dispositivos en la red propia |
 
 Ejemplo en modo AP:
 
@@ -264,7 +287,7 @@ Las consultas `/estado` no salen salvo con `DEPURAR_ESTADO` a `true`. Con `DEPUR
 
 El programa reparte el trabajo en tres partes que no se bloquean entre sí:
 
-- **Pulsos del motor.** `moverMotor()` fija DIR, apunta cuántos pulsos hay que dar y arranca un temporizador del ESP32 (`esp_timer`). El temporizador alterna la salida STEP en `darPaso()` a intervalos fijos, medio periodo de paso según la velocidad (6 ms a 25 rpm con 200 pulsos por vuelta), pase lo que pase con la web, así que el giro no se frena mientras se atiende una petición y el número de pulsos es exacto. El intervalo mínimo del temporizador es de 50 µs.
+- **Pulsos del motor.** `moverMotor()` fija DIR, apunta cuántos pulsos hay que dar y arranca un temporizador hardware del ESP32. Su interrupción, `darPaso()`, alterna la salida STEP a intervalos fijos, medio periodo de paso según la velocidad (6 ms a 25 rpm con 200 pulsos por vuelta), pase lo que pase con la web, así que el giro no se frena mientras se atiende una petición y el número de pulsos es exacto. La interrupción corre en el núcleo 1 y la WiFi en el núcleo 0, así que la WiFi no retrasa los pulsos. El intervalo mínimo es de 50 µs.
 - **Servidor web.** Usa `esp_http_server`, el servidor del sistema del ESP32, en su propia tarea. Mantiene varias conexiones abiertas, pero atiende las peticiones de una en una. Por eso:
   - El servidor deja de esperar a un navegador que no responde a los `WEB_ESPERA_S` segundos.
   - El keep-alive de TCP cierra las conexiones de móviles que ya no contestan.
@@ -276,12 +299,44 @@ La web y el bucle principal comparten el estado del motor y de los relés con un
 
 La secuencia automática del sensor de pienso se guarda con `Preferences`, en la memoria no volátil del ESP32.
 
+Las órdenes son funciones que reciben la consulta (`vueltas=0.25&sentido=der`) y devuelven el código y el texto, así que la web y el puerto serie usan las mismas. Las del puerto serie se atienden en `loop()`.
+
+### Rendimiento
+
+`/diagnostico` y la línea `[sistema]` miden:
+
+| Medida | Qué es | Valor normal |
+|---|---|---|
+| `paso_desvio_max_us` | Lo más que se ha apartado un cambio de STEP de su medio periodo | Menos de 10 µs |
+| `pasos_irregulares` | Cambios de STEP desviados más del 20 % del medio periodo | 0 |
+| `bucle_max_us` | Pasada más larga de `loop()`. Una orden de mover por el puerto serie suma los 5 ms de `ENABLE_ESPERA_MS` | Unos pocos ms |
+| `atencion_max_ms` | Petición web más lenta, de principio a fin | Pocos ms con buena señal |
+
+Medidas en la placa con la prueba de `control_serie.py --prueba`, sin nadie conectado a la web:
+
+| Versión | WiFi | Desvío máximo de los pulsos | Pulsos irregulares a 300 rpm | Bucle máximo |
+|---|---|---|---|---|
+| Antes, con `esp_timer` | Apagada | 5 µs | 0 | 24 ms |
+| Antes, con `esp_timer` | Modo AP | 513 µs | 34 de 6000 | 24 ms |
+| Antes, con `esp_timer` | Modo host buscando red | 919 µs | 14 de 1426 | 34 ms |
+| Ahora, temporizador hardware | Modo AP o host | 5 µs | 0 | 7 ms |
+
+Qué se cambió:
+
+- **Pulsos con temporizador hardware.** `esp_timer` atiende sus avisos en una tarea del núcleo 0, la misma CPU que la WiFi, y la WiFi la retrasaba hasta casi 1 ms. A 300 rpm el medio periodo es de 500 µs, así que el motor recibía pulsos dobles o huecos y podía vibrar o perder pasos.
+- **Búfer de envío del Monitor Serie** (`Serial.setTxBufferSize`). Sin búfer, cada mensaje dejaba esperando a quien lo escribía hasta que salía por el cable: la línea `[sistema]` paraba `loop()` 24 ms, y los mensajes de la web frenaban el servidor.
+- **Página preparada al arrancar** (`prepararPagina()`). Antes se copiaban y rellenaban 15 KB en cada visita.
+- **`/estado` en un búfer fijo**, en lugar de un `String` que se alarga campo a campo cada segundo por cada navegador abierto.
+- **Sin ahorro de energía en modo host** (`WiFi.setSleep(false)`). Con el ahorro, la WiFi duerme entre balizas del router y cada petición podía esperar cientos de milisegundos.
+
 ## Estructura del repositorio
 
 ```
 control_motor_paso_a_paso/
   control_motor_paso_a_paso.ino   programa completo, con la página web incluida
   credenciales.h.ejemplo          plantilla de las redes WiFi (copiar como credenciales.h)
+pc/
+  control_serie.py                app del PC por el puerto serie y prueba de rendimiento
 docu/
   readme.txt                      cableado detallado, ajuste del driver y microstepping
   *.pdf                           hojas de datos del motor, el driver y el ULN2803

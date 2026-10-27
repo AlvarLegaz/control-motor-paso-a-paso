@@ -130,6 +130,9 @@
 // enciende los reles segun el modo elegido en la web.
 #define DISPARO_ESPERA_MS   1000
 
+#define FOTO1_PIN            15      // Fotodetector 1: D15, activo a nivel LOW
+#define FOTO2_PIN            16      // Fotodetector 2: D16, activo a nivel LOW
+
 // Sensor de pienso: PENDIENTE. De momento la web solo guarda la secuencia
 // automatica y el boton "Simular deteccion" la lanza. Cuando haya sensor,
 // leerlo en loop() y llamar a piensoDetectado() al detectar.
@@ -151,7 +154,7 @@
 //   parpadeo                  = modo AP, red propia ESP32_MOTOR
 //   parpadeo el doble de rapido = modo host buscando red (o conexion perdida)
 //   fijo                      = modo host conectado
-#define LED_PIN             2
+#define LED_PIN              2      // LED de estado WiFi en GPIO2
 #define LED_ENCENDIDO       HIGH    // cambia a LOW si tu LED se enciende al reves
 #define LED_AP_MS           500     // medio periodo del parpadeo en modo AP
                                     // (buscando red: la mitad, el doble de rapido)
@@ -723,10 +726,13 @@ const char PAGINA[] PROGMEM = R"rawliteral(
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Control motor paso a paso</title>
 <style>
-  body { font-family: sans-serif; max-width: 420px; margin: 0 auto; padding: 16px;
-         background: #f2f2f2; color: #222; }
+  body { font-family: sans-serif; max-width: 720px; margin: 0 auto; padding: 16px;
+         background: #f2f2f2; color: #222; display: grid;
+         grid-template-columns: minmax(0, 1fr); gap: 12px; align-items: start; }
+  h1 { grid-column: 1 / -1; }
+  @media (max-width: 650px) { body { grid-template-columns: 1fr; } }
   h1 { font-size: 1.4em; text-align: center; }
-  .caja { background: #fff; border-radius: 8px; padding: 16px; margin-bottom: 12px; }
+  .caja { background: #fff; border-radius: 8px; padding: 16px; min-width: 0; }
   label { display: block; margin-bottom: 6px; }
   input { width: 100%; font-size: 1.3em; padding: 8px; box-sizing: border-box; }
   .fila { display: flex; gap: 10px; }
@@ -762,14 +768,20 @@ const char PAGINA[] PROGMEM = R"rawliteral(
   .opciones.apagadas { opacity: 0.45; }
   button.sensor-boton { background: #6a1b9a; }
   #estado { font-weight: bold; }
+  .dato-motor { padding-bottom: 12px; margin-bottom: 12px; border-bottom: 1px solid #eee; }
+  .columna-derecha { display: contents; }
+  .pilotos-entradas { display: flex; flex-wrap: wrap; gap: 16px; margin: 12px 0; }
+  .piloto-entrada { display: flex; align-items: center; gap: 8px; font-weight: 600; }
+  .piloto-entrada .piloto { width: 22px; height: 22px; }
+  .caja-estado { grid-column: 1 / -1; }
+  @media (max-width: 650px) { .caja-estado { grid-column: auto; } }
 </style>
 </head>
 <body>
   <h1>Control motor paso a paso</h1>
 
-  <div class="caja">Pulsos por vuelta: <b>%PPV%</b></div>
-
   <div class="caja">
+    <div class="dato-motor">Pulsos por vuelta: <b>%PPV%</b></div>
     <div class="deslizador">
       <label for="rpm"><span>Velocidad</span><b><span id="rpmTexto">%RPM%</span> rpm</b></label>
       <input id="rpm" type="range" min="%RPM_MIN%" max="%RPM_MAX%" step="5" value="%RPM%"
@@ -794,6 +806,7 @@ const char PAGINA[] PROGMEM = R"rawliteral(
     <div class="nota">Avanzar gira a la derecha y retroceder a la izquierda. Cada paso son %GRADOS_PASO%°.</div>
   </div>
 
+  <div class="columna-derecha">
   <div class="caja">
     <div class="rele-fila">
       <div>
@@ -829,7 +842,11 @@ const char PAGINA[] PROGMEM = R"rawliteral(
   <div class="caja">
     <div class="sensor">
       <span class="piloto" id="piloto"></span>
-      <div><b>Sensor de pienso</b><br><span id="sensorTexto">sin sensor conectado (maqueta)</span></div>
+      <div><b>Sensor de pienso</b><br><span id="sensorTexto">fotodetectores conectados</span></div>
+    </div>
+    <div class="pilotos-entradas" aria-label="Estado de los fotodetectores">
+      <div class="piloto-entrada"><span class="piloto" id="foto1" role="img" aria-label="D15 sin detección"></span><span>D15</span></div>
+      <div class="piloto-entrada"><span class="piloto" id="foto2" role="img" aria-label="D16 sin detección"></span><span>D16</span></div>
     </div>
     <label class="interruptor"><input type="checkbox" id="autoActivo" onchange="guardarAutomatico()">
       Disparo automático al detectar pienso</label>
@@ -844,7 +861,9 @@ const char PAGINA[] PROGMEM = R"rawliteral(
     <div class="nota">La selección se guarda en el ESP32 y se mantiene al apagarlo.</div>
   </div>
 
-  <div class="caja">
+  </div> <!-- columna derecha -->
+
+  <div class="caja caja-estado">
     Motor: <span id="estado">-</span><br>
     Disparo: <span id="disparo">-</span><br>
     Relé 1: <span id="rele1">-</span><br>
@@ -1001,9 +1020,18 @@ const char PAGINA[] PROGMEM = R"rawliteral(
           verAutomatico();
           automaticoLeido = true;
         }
+        // Pilotos individuales: encendidos mientras la entrada detecta (LOW).
+        ['foto1', 'foto2'].forEach((id, i) => {
+          const detectado = i === 0 ? e.foto_d15 : e.foto_d16;
+          const pilotoEntrada = document.getElementById(id);
+          pilotoEntrada.classList.toggle('activo', !!detectado);
+          pilotoEntrada.setAttribute('aria-label', (i === 0 ? 'D15' : 'D16') +
+            (detectado ? ': detección activa' : ': sin detección'));
+          pilotoEntrada.title = detectado ? 'Detectado (LOW)' : 'Libre (HIGH)';
+        });
         // Piloto del sensor: se enciende 2 s con cada deteccion nueva
-        document.getElementById('sensorTexto').textContent = 'sin sensor conectado (maqueta)' +
-          (e.pienso_detecciones ? ', ' + e.pienso_detecciones + ' detecciones simuladas' : '');
+        document.getElementById('sensorTexto').textContent = 'fotodetectores conectados' +
+          (e.pienso_detecciones ? ', ' + e.pienso_detecciones + ' detecciones de prueba' : '');
         if (detecciones !== null && e.pienso_detecciones > detecciones) {
           var piloto = document.getElementById('piloto');
           piloto.classList.add('activo');
@@ -1360,18 +1388,21 @@ Respuesta ordenEstado(const char* consulta) {
 
   // Se compone de una vez en un bufer: la pagina lo pide cada segundo y asi
   // no hay que ir alargando un String (y pidiendo memoria) campo a campo.
-  char json[512];
+  bool fotoD15 = digitalRead(FOTO1_PIN) == LOW;
+  bool fotoD16 = digitalRead(FOTO2_PIN) == LOW;
+  char json[576];
   snprintf(json, sizeof(json),
            "{\"moviendo\":%s,\"pulsos_pendientes\":%ld,\"sentido\":\"%s\","
            "\"pulsos_por_vuelta\":%d,\"con_corriente\":%s,"
            "\"rele\":%s,\"rele_ms_restantes\":%lu,\"rele2\":%s,\"rele2_ms_restantes\":%lu,"
            "\"serie_siguiente\":%d,\"serie_ms\":%lu,\"disparo\":\"%s\",\"disparo_modo\":\"%s\","
-           "\"rpm\":%d,\"auto_activo\":%s,\"auto_modo\":\"%s\",\"pienso_detecciones\":%lu}",
+           "\"rpm\":%d,\"auto_activo\":%s,\"auto_modo\":\"%s\",\"pienso_detecciones\":%lu,\"foto_d15\":%s,\"foto_d16\":%s}",
            pendientes > 0 ? "true" : "false", pendientes, derecha ? "derecha" : "izquierda",
            PULSOS_POR_VUELTA, conCorriente ? "true" : "false",
            rele ? "true" : "false", restante, rele2 ? "true" : "false", restante2,
            serieSig, msSerie, fase, modo.c_str(),
-           rpm, automatico ? "true" : "false", modoAuto.c_str(), detecciones);
+           rpm, automatico ? "true" : "false", modoAuto.c_str(), detecciones,
+           fotoD15 ? "true" : "false", fotoD16 ? "true" : "false");
   return Respuesta{200, JSON, json};
 }
 
@@ -1548,12 +1579,12 @@ void actualizarLed() {
   static bool encendido = false;
 
   if (modoWifi == MODO_HOST && WiFi.status() == WL_CONNECTED) {
-    digitalWrite(LED_PIN, LED_ENCENDIDO);
+    if (LED_PIN >= 0) digitalWrite(LED_PIN, LED_ENCENDIDO);
     encendido = true;
     return;
   }
   if (modoWifi == MODO_APAGADO) {
-    digitalWrite(LED_PIN, !LED_ENCENDIDO);
+    if (LED_PIN >= 0) digitalWrite(LED_PIN, !LED_ENCENDIDO);
     encendido = false;
     return;
   }
@@ -1561,7 +1592,7 @@ void actualizarLed() {
   if (millis() - ultimoCambio >= medioPeriodo) {
     ultimoCambio = millis();
     encendido = !encendido;
-    digitalWrite(LED_PIN, encendido ? LED_ENCENDIDO : !LED_ENCENDIDO);
+    if (LED_PIN >= 0) digitalWrite(LED_PIN, encendido ? LED_ENCENDIDO : !LED_ENCENDIDO);
   }
 }
 
@@ -1755,8 +1786,9 @@ void setup() {
     digitalWrite(reles[i].pin, !RELE_ACTIVO);
   }
 
-  pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, !LED_ENCENDIDO);
+  if (LED_PIN >= 0) { pinMode(LED_PIN, OUTPUT); digitalWrite(LED_PIN, !LED_ENCENDIDO); }
+  pinMode(FOTO1_PIN, INPUT_PULLUP);
+  pinMode(FOTO2_PIN, INPUT_PULLUP);
 
   // Candado entre la web y loop() (ver candadoEstado)
   candadoEstado = xSemaphoreCreateMutex();
